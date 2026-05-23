@@ -11,6 +11,11 @@ struct Comment {
     int          like_count = 0;
 };
 
+struct SongInfo {
+    std::wstring id;
+    std::wstring cover_url;
+};
+
 /** Return false to stop iteration early. */
 using CommentVisitor = std::function<bool(const Comment&)>;
 
@@ -24,6 +29,9 @@ public:
      */
     std::wstring search_song(const std::wstring& keyword,
                              std::wstring&       error_msg);
+
+    SongInfo search_song_info(const std::wstring& keyword,
+                              std::wstring&       error_msg);
 
     /**
      * Iterate comments for song_id.

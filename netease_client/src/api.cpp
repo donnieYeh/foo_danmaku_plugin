@@ -77,6 +77,15 @@ std::wstring ApiClient::search_song(
     const std::wstring& keyword,
     std::wstring&       error_msg)
 {
+    SongInfo info = search_song_info(keyword, error_msg);
+    return info.id;
+}
+
+SongInfo ApiClient::search_song_info(
+    const std::wstring& keyword,
+    std::wstring&       error_msg)
+{
+    SongInfo info;
     std::string kw_utf8 = json::to_utf8(keyword);
     loga("search_song keyword: " + kw_utf8);
 
@@ -86,10 +95,10 @@ std::wstring ApiClient::search_song(
 
     std::string raw;
     if (!m_http.post(L"/api/cloudsearch/pc", body, raw, error_msg))
-        return L"";
+        return info;
 
     std::string resp = api_call(raw, error_msg);
-    if (resp.empty()) return L"";
+    if (resp.empty()) return info;
 
     /* Parse result.songs[0].id */
     const char* result_start = strstr(resp.c_str(), "\"result\":{");
@@ -102,17 +111,22 @@ std::wstring ApiClient::search_song(
     if (songs.empty()) {
         error_msg = L"No songs found for: " + keyword;
         loga("search_song: no songs in response");
-        return L"";
+        return info;
     }
 
     long long id = json::num(songs[0], "id", 0);
     if (id == 0) {
         error_msg = L"Failed to parse song ID";
         log(L"songs[0]=" + json::to_wide(songs[0].substr(0, 80)));
-        return L"";
+        return info;
     }
     log(L"search_song: found id=" + std::to_wstring(id));
-    return std::to_wstring(id);
+    info.id = std::to_wstring(id);
+    info.cover_url = json::to_wide(json::str(songs[0], "picUrl"));
+    if (!info.cover_url.empty()) {
+        log(L"search_song: cover_url=" + info.cover_url);
+    }
+    return info;
 }
 
 /* ── parse_comment_list: shared for hotComments+comments */

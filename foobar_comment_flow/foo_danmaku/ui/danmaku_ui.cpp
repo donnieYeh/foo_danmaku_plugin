@@ -10,14 +10,18 @@
 #include <objidl.h>
 #include <gdiplus.h>
 #include <shlwapi.h>
+#include <urlmon.h>
 #include <string>
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <vector>
+#include <memory>
 
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "urlmon.lib")
 
 // ── logging helpers ──────────────────────────────────────
 // Writes to foobar2000's View→Console AND OutputDebugString.
@@ -86,8 +90,37 @@ static HBITMAP decodeCoverBytes(const void* data, size_t size) {
     {
         Gdiplus::Bitmap bmp(stream, FALSE);
         if (bmp.GetLastStatus() == Gdiplus::Ok) {
-            const UINT srcW = bmp.GetWidth();
-            const UINT srcH = bmp.GetHeight();
+            Gdiplus::Bitmap* source = &bmp;
+            std::unique_ptr<Gdiplus::Bitmap> croppedRightHalf;
+
+            UINT srcW = bmp.GetWidth();
+            UINT srcH = bmp.GetHeight();
+
+            // Some files embed booklet scans as a two-page spread. When the
+            // cover is close to 2:1, treat it as left+right pages and keep the
+            // right page only. This happens before the 1000px downsample and is
+            // fully in-memory.
+            if (srcW > 0 && srcH > 0) {
+                float aspect = (float)srcW / (float)srcH;
+                if (aspect >= 1.85f && aspect <= 2.15f) {
+                    UINT cropX = srcW / 2;
+                    UINT cropW = srcW - cropX;
+                    croppedRightHalf.reset(new Gdiplus::Bitmap(cropW, srcH, PixelFormat32bppARGB));
+                    Gdiplus::Graphics cg(croppedRightHalf.get());
+                    cg.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+                    cg.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+                    cg.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+                    cg.DrawImage(&bmp,
+                        Gdiplus::Rect(0, 0, (INT)cropW, (INT)srcH),
+                        cropX, 0, cropW, srcH,
+                        Gdiplus::UnitPixel);
+                    source = croppedRightHalf.get();
+                    srcW = cropW;
+                    // srcH unchanged
+                    danmaku_log("[Danmaku] cover art looks like 2-page BK spread; using right half");
+                }
+            }
+
             const UINT kMaxCoverSide = 1000;
             if (srcW > kMaxCoverSide || srcH > kMaxCoverSide) {
                 float scale = std::min((float)kMaxCoverSide / (float)srcW,
@@ -99,16 +132,36 @@ static HBITMAP decodeCoverBytes(const void* data, size_t size) {
                 g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
                 g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
                 g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-                g.DrawImage(&bmp, Gdiplus::Rect(0, 0, (INT)dstW, (INT)dstH),
+                g.DrawImage(source, Gdiplus::Rect(0, 0, (INT)dstW, (INT)dstH),
                             0, 0, srcW, srcH, Gdiplus::UnitPixel);
                 resized.GetHBITMAP(Gdiplus::Color(0, 0, 0), &out);
             } else {
-                bmp.GetHBITMAP(Gdiplus::Color(0, 0, 0), &out);
+                source->GetHBITMAP(Gdiplus::Color(0, 0, 0), &out);
             }
         }
     }
     stream->Release();
     return out;
+}
+
+static HBITMAP downloadAndDecodeCoverUrl(const wchar_t* url) {
+    if (!url || !*url) return nullptr;
+    IStream* stream = nullptr;
+    HRESULT hr = URLOpenBlockingStreamW(nullptr, url, &stream, 0, nullptr);
+    if (FAILED(hr) || !stream) return nullptr;
+
+    std::vector<BYTE> bytes;
+    BYTE buf[8192];
+    for (;;) {
+        ULONG read = 0;
+        hr = stream->Read(buf, sizeof(buf), &read);
+        if (FAILED(hr) || read == 0) break;
+        bytes.insert(bytes.end(), buf, buf + read);
+        if (bytes.size() > 20 * 1024 * 1024) break; // sanity cap
+    }
+    stream->Release();
+    if (bytes.empty()) return nullptr;
+    return decodeCoverBytes(bytes.data(), bytes.size());
 }
 
 static void fetchAndApplyCoverArtAsync(metadb_handle_ptr track, uint64_t gen);
@@ -344,7 +397,9 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
         std::wstring kw = titleStr;
         if (!artistStr.empty()) kw += L" " + artistStr;
         wchar_t song_id[64] = {0};
-        int rc = netease_search_song(g_netease, kw.c_str(), song_id, 64);
+        wchar_t cover_url[1024] = {0};
+        int rc = netease_search_song_with_cover(
+            g_netease, kw.c_str(), song_id, 64, cover_url, 1024);
         if (rc != NETEASE_OK) {
             std::wstring err = L"[Danmaku] search_song FAILED rc="
                              + std::to_wstring(rc)
@@ -354,6 +409,25 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
             return;
         }
         if (cancelled()) { return; }
+
+        // If the local file has no embedded/front cover but NetEase search
+        // resolved comments and a cover URL, use NetEase's cover as the vinyl
+        // label and the ambient background. It goes through the same in-memory
+        // 1000x1000 cap in decodeCoverBytes().
+        if (cover_url[0] && g_engine && !g_engine->hasCoverArt()) {
+            HBITMAP neteaseCover = downloadAndDecodeCoverUrl(cover_url);
+            if (cancelled()) {
+                if (neteaseCover) DeleteObject(neteaseCover);
+                return;
+            }
+            if (neteaseCover && g_engine && !g_engine->hasCoverArt()) {
+                g_engine->setCoverArt(neteaseCover);
+                danmaku_log("[Danmaku] NetEase cover applied as fallback");
+                if (IsWindow(targetHwnd)) InvalidateRect(targetHwnd, nullptr, FALSE);
+            } else if (neteaseCover) {
+                DeleteObject(neteaseCover);
+            }
+        }
 
         // ── Step 2: fetch initial burst (one page of 100) so playback can start ──
         int delivered = 0;

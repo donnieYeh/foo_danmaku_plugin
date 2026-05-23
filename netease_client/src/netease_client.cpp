@@ -69,6 +69,35 @@ NETEASE_API int __stdcall netease_search_song(
     return NETEASE_OK;
 }
 
+NETEASE_API int __stdcall netease_search_song_with_cover(
+    NeteaseHandle  h,
+    const wchar_t* keyword,
+    wchar_t*       out_song_id,
+    int            song_id_buf_wchars,
+    wchar_t*       out_cover_url,
+    int            cover_url_buf_wchars)
+{
+    if (!h || !keyword || !out_song_id || song_id_buf_wchars < 2)
+        return NETEASE_ERR_PARAM;
+
+    if (out_cover_url && cover_url_buf_wchars > 0) out_cover_url[0] = 0;
+
+    NeteaseContext* c = ctx(h);
+    std::wstring err;
+    netease::SongInfo info = c->api.search_song_info(keyword, err);
+    if (info.id.empty()) {
+        set_error(c, err);
+        return err.find(L"No songs") != std::wstring::npos
+               ? NETEASE_ERR_NOTFOUND : NETEASE_ERR_NETWORK;
+    }
+    wcsncpy_s(out_song_id, song_id_buf_wchars, info.id.c_str(), _TRUNCATE);
+    if (out_cover_url && cover_url_buf_wchars > 0 && !info.cover_url.empty()) {
+        wcsncpy_s(out_cover_url, cover_url_buf_wchars,
+                  info.cover_url.c_str(), _TRUNCATE);
+    }
+    return NETEASE_OK;
+}
+
 /* ── get_comments_by_id ──────────────────────────────── */
 
 NETEASE_API int __stdcall netease_get_comments_by_id(

@@ -116,6 +116,11 @@ void DanmakuEngine::setCoverArt(HBITMAP bitmap) {
     }
 }
 
+bool DanmakuEngine::hasCoverArt() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_coverBitmap != nullptr && m_coverBitmapW > 0 && m_coverBitmapH > 0;
+}
+
 void DanmakuEngine::setArmLanded(bool landed) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_armLanded = landed;

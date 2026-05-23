@@ -116,6 +116,19 @@ NETEASE_API int __stdcall netease_search_song(
     int            buf_wchars
 );
 
+/**
+ * Search a song and also return its NetEase album cover URL when available.
+ * All output buffers are caller-allocated. out_cover_url may be NULL.
+ */
+NETEASE_API int __stdcall netease_search_song_with_cover(
+    NeteaseHandle  h,
+    const wchar_t* keyword,
+    wchar_t*       out_song_id,
+    int            song_id_buf_wchars,
+    wchar_t*       out_cover_url,
+    int            cover_url_buf_wchars
+);
+
 /* ── diagnostics ─────────────────────────────────────── */
 
 /**

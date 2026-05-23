@@ -48,6 +48,7 @@ public:
     // of the HBITMAP and will DeleteObject it on replacement / shutdown.
     // Pass nullptr to clear the cover and fall back to the decorative wedges.
     void setCoverArt(HBITMAP bitmap);
+    bool hasCoverArt() const;
 
     // Toggles the tone-arm landing animation. When true the arm swings onto
     // the record; when false it parks at the rest position outside the disc.

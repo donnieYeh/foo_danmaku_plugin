@@ -37,3 +37,4 @@ Thumbs.db
 # Keep vendored SDK/runtime DLLs trackable when explicitly needed.
 !**/SDK/**/*.dll
 !**/SDK/**/*.lib
+release/*
