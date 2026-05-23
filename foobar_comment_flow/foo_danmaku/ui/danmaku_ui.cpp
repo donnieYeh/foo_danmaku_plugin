@@ -3,7 +3,8 @@
 #include "ui/danmaku_preferences.h"
 #include "../core/danmaku_engine.h"
 #include "../core/playback_monitor.h"
-#include "music_client.h"    // Layer-2 music data client (static lib)
+#include "music_client.h"         // Layer-2 music data client (static lib)
+#include "core/provider_manager.h"  // g_music global (owned by initquit)
 #include <windows.h>
 #include <windowsx.h>
 #include <mmsystem.h>
@@ -53,7 +54,7 @@ const GUID g_danmaku_guid = { 0xa1b2c3d4, 0xe5f6, 0x7890, {0xab, 0xcd, 0xef, 0x1
 
 static DanmakuEngine*  g_engine  = nullptr;
 static PlaybackMonitor* g_monitor = nullptr;
-static MusicClientHandle g_music   = nullptr;
+// g_music is defined in provider_manager.cpp and initialised by initquit.
 static std::atomic<bool> g_fetching{false};
 
 // GDI+ token + ref count so multiple UI elements share one Startup/Shutdown.
@@ -273,32 +274,8 @@ DanmakuUIInstance::DanmakuUIInstance(HWND parent, ui_element_instance_callback_p
     g_monitor->setOnNewTrack(onNewTrackCallback, m_wnd);
     g_monitor->setOnPlayState(onPlayStateCallback, m_wnd);
 
-    if (!g_music) {
-        g_music = music_client_create();
-
-        // Route all music_client / provider logs → foobar2000 View→Console
-        music_client_set_log(g_music, [](const wchar_t* msg, void*) {
-            danmaku_logW(msg);
-        }, nullptr);
-
-        // Resolve netease_client.dll path relative to foo_danmaku.dll
-        wchar_t provider_path[MAX_PATH] = {};
-        HMODULE self = GetModuleHandleW(L"foo_danmaku.dll");
-        if (self && GetModuleFileNameW(self, provider_path, MAX_PATH) > 0) {
-            wchar_t* sep = wcsrchr(provider_path, L'\\');
-            if (sep) wcscpy_s(sep + 1, MAX_PATH - (int)(sep + 1 - provider_path),
-                              L"netease_client.dll");
-        } else {
-            wcscpy_s(provider_path, L"netease_client.dll"); // fallback: DLL search path
-        }
-
-        int rc = music_client_load_provider(g_music, provider_path, nullptr);
-        if (rc != MUSIC_OK) {
-            danmaku_log("[Danmaku] WARNING: failed to load netease_client.dll");
-        } else {
-            danmaku_log("[Danmaku] music_client ready, netease provider loaded");
-        }
-    }
+    // g_music is created and providers are loaded by DanmakuProviderInit::on_init().
+    // Nothing to do here.
 
     if (g_engine) {
         DanmakuConfig cfg = g_engine->getConfig();

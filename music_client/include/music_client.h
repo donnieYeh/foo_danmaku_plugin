@@ -86,6 +86,26 @@ int music_client_load_provider(
     const wchar_t*    dll_path,
     const wchar_t*    cookie);
 
+/* ── provider introspection ─────────────────────────── */
+
+/** Number of providers currently loaded (0 if none). */
+int music_client_get_provider_count(MusicClientHandle h);
+
+/** Full DLL path of the provider at position @p index.
+ *  Returns NULL if @p index is out of range.
+ *  Pointer valid until the provider list is modified. */
+const wchar_t* music_client_get_provider_path(MusicClientHandle h, int index);
+
+/** Reorder loaded providers.
+ *  @p new_order[i] = current index of the provider to place at position i.
+ *  @p count must equal music_client_get_provider_count().
+ *  After reordering, search falls back through providers in the new order.
+ *  Returns MUSIC_OK or MUSIC_ERR_PARAM. */
+int music_client_reorder_providers(
+    MusicClientHandle h,
+    const int*        new_order,
+    int               count);
+
 /* ── search ──────────────────────────────────────────── */
 
 /** Search for a song and return its platform ID plus optional cover-art URL.

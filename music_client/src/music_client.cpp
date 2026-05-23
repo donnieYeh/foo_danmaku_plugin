@@ -28,10 +28,12 @@ struct ProviderSlot {
     HMODULE                    dll    = nullptr;
     MusicProviderHandle        handle = nullptr;
     const MusicProviderVTable* vtable = nullptr;
+    std::wstring               path;           /* full DLL path, for introspection */
 };
 
 struct MusicClientCtx {
     std::vector<ProviderSlot> providers;
+    int                       search_provider_idx = 0; /* set by last successful search */
     std::wstring              last_error;
     MusicClientLogCallback    log_cb       = nullptr;
     void*                     log_userdata = nullptr;
@@ -41,11 +43,6 @@ struct MusicClientCtx {
         if (log_cb) log_cb(msg, log_userdata);
     }
     void log(const std::wstring& msg) const { log(msg.c_str()); }
-
-    /* Return the first loaded provider, or nullptr. */
-    ProviderSlot* active() {
-        return providers.empty() ? nullptr : &providers[0];
-    }
 };
 
 /* ── helpers ─────────────────────────────────────────── */
@@ -136,7 +133,8 @@ int music_client_load_provider(
     slot.dll    = dll;
     slot.handle = ph;
     slot.vtable = vtable;
-    c->providers.push_back(slot);
+    slot.path   = dll_path;
+    c->providers.push_back(std::move(slot));
 
     c->log(std::wstring(L"[music_client] provider loaded: ") + dll_path);
     return MUSIC_OK;
@@ -156,22 +154,31 @@ int music_client_search_song(
         return MUSIC_ERR_PARAM;
 
     MusicClientCtx* c = ctx(h);
-    ProviderSlot*   s = c->active();
-    if (!s) {
+    if (c->providers.empty()) {
         c->last_error = L"No provider loaded";
         return MUSIC_ERR_NO_PROVIDER;
     }
 
-    int rc = s->vtable->search_song(
-        s->handle,
-        keyword,
-        out_song_id, song_id_buf_wchars,
-        out_cover_url, cover_url_buf_wchars);
-
-    if (rc != MUSIC_OK)
-        c->last_error = s->vtable->last_error(s->handle);
-
-    return rc;
+    /* Fallback: try each provider in priority order, stop at first success. */
+    int last_rc = MUSIC_ERR_NO_PROVIDER;
+    for (int i = 0; i < (int)c->providers.size(); i++) {
+        ProviderSlot& s = c->providers[i];
+        int rc = s.vtable->search_song(
+            s.handle,
+            keyword,
+            out_song_id, song_id_buf_wchars,
+            out_cover_url, cover_url_buf_wchars);
+        if (rc == MUSIC_OK) {
+            c->search_provider_idx = i;
+            return MUSIC_OK;
+        }
+        c->last_error = s.vtable->last_error(s.handle);
+        c->log(std::wstring(L"[music_client] provider[") + s.path
+               + L"] search failed (rc=" + std::to_wstring(rc)
+               + L"), trying next");
+        last_rc = rc;
+    }
+    return last_rc;
 }
 
 /* ── comments ────────────────────────────────────────── */
@@ -190,11 +197,15 @@ int music_client_get_comments_paged(
         return MUSIC_ERR_PARAM;
 
     MusicClientCtx* c = ctx(h);
-    ProviderSlot*   s = c->active();
-    if (!s) {
+    if (c->providers.empty()) {
         c->last_error = L"No provider loaded";
         return MUSIC_ERR_NO_PROVIDER;
     }
+    /* Comments must come from the same provider that resolved the song_id. */
+    int idx = c->search_provider_idx;
+    if (idx < 0 || idx >= (int)c->providers.size()) idx = 0;
+    ProviderSlot& slot_ref = c->providers[idx];
+    ProviderSlot* s = &slot_ref;
 
     /* MusicClientCommentCallback and MusicCommentCallback share the same
      * signature and calling convention (__stdcall), so a direct cast is safe
@@ -214,6 +225,42 @@ int music_client_get_comments_paged(
         c->last_error = s->vtable->last_error(s->handle);
 
     return rc;
+}
+
+/* ── provider introspection ──────────────────────────────── */
+
+int music_client_get_provider_count(MusicClientHandle h) {
+    if (!h) return 0;
+    return (int)ctx(h)->providers.size();
+}
+
+const wchar_t* music_client_get_provider_path(MusicClientHandle h, int index) {
+    if (!h) return nullptr;
+    auto* c = ctx(h);
+    if (index < 0 || index >= (int)c->providers.size()) return nullptr;
+    return c->providers[index].path.c_str();
+}
+
+int music_client_reorder_providers(
+    MusicClientHandle h,
+    const int*        new_order,
+    int               count)
+{
+    if (!h || !new_order || count <= 0) return MUSIC_ERR_PARAM;
+    auto* c = ctx(h);
+    if (count != (int)c->providers.size()) return MUSIC_ERR_PARAM;
+    /* Validate indices. */
+    for (int i = 0; i < count; i++)
+        if (new_order[i] < 0 || new_order[i] >= count) return MUSIC_ERR_PARAM;
+
+    std::vector<ProviderSlot> reordered;
+    reordered.reserve(count);
+    for (int i = 0; i < count; i++)
+        reordered.push_back(std::move(c->providers[new_order[i]]));
+    c->providers = std::move(reordered);
+    c->search_provider_idx = 0;
+    c->log(L"[music_client] provider order updated");
+    return MUSIC_OK;
 }
 
 /* ── cover download ──────────────────────────────────── */

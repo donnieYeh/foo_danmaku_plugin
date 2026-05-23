@@ -57,8 +57,8 @@ $projectSrc = @(
     "$PROJECT\ui\danmaku_ui.cpp",
     "$PROJECT\ui\danmaku_preferences.cpp",
     "$PROJECT\core\danmaku_engine.cpp",
-    "$PROJECT\core\playback_monitor.cpp"
-    # netEase/api.cpp and signature.cpp replaced by netease_client.dll
+    "$PROJECT\core\playback_monitor.cpp",
+    "$PROJECT\core\provider_manager.cpp"   # initquit + g_music lifecycle
 )
 
 $sdkSrc = @(
@@ -150,6 +150,7 @@ $linkFlags = @(
     "/LIBPATH:$MUSIC_ROOT\build\$Platform",  # music_client.lib (static, Layer 2)
     "kernel32.lib", "user32.lib", "gdi32.lib",
     "advapi32.lib", "shell32.lib", "ole32.lib", "uuid.lib",
+    "comctl32.lib",
     "music_client.lib",
     # netease_client.lib is NOT linked here — it is loaded at runtime
     # by music_client via LoadLibraryW.

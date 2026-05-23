@@ -1,8 +1,14 @@
 ﻿#include "ui/danmaku_preferences.h"
+#include "core/provider_manager.h"
 #include <foobar2000/SDK/foobar2000.h>
 #include <foobar2000/SDK/cfg_var.h>
 #include <windows.h>
+#include <commctrl.h>
+#include <windowsx.h>
 #include <algorithm>
+#include <vector>
+#include <string>
+#pragma comment(lib, "comctl32.lib")
 
 // {7C6DB3BB-6C17-46E3-9C3F-10CE511E7F0D}
 static constexpr GUID guid_cfg_spawn_interval =
@@ -113,7 +119,8 @@ public:
     DanmakuPreferencesInstance(HWND parent, preferences_page_callback::ptr cb)
         : m_parent(parent), m_callback(cb), m_wnd(nullptr),
           m_intervalEdit(nullptr), m_tracksEdit(nullptr), m_speedEdit(nullptr),
-          m_turntableSpeedEdit(nullptr), m_bkAspectMinEdit(nullptr), m_bkAspectMaxEdit(nullptr) {
+          m_turntableSpeedEdit(nullptr), m_bkAspectMinEdit(nullptr), m_bkAspectMaxEdit(nullptr),
+          m_providerList(nullptr), m_dragSrc(-1), m_dragDst(-1), m_dragging(false) {
         createWindow();
     }
 
@@ -142,6 +149,7 @@ public:
         writeTurntableSpeed(danmaku_get_turntable_speed_percent());
         writeBkAspectMin(danmaku_get_bk_aspect_min_tenths());
         writeBkAspectMax(danmaku_get_bk_aspect_max_tenths());
+        applyProviderOrder();
         if (m_callback.is_valid()) m_callback->on_state_changed();
     }
 
@@ -156,7 +164,7 @@ public:
     }
 
 private:
-    enum { IDC_INTERVAL = 1001, IDC_TRACKS = 1002, IDC_SPEED = 1003, IDC_TURNTABLE_SPEED = 1004, IDC_BK_ASPECT_MIN = 1005, IDC_BK_ASPECT_MAX = 1006 };
+    enum { IDC_INTERVAL = 1001, IDC_TRACKS = 1002, IDC_SPEED = 1003, IDC_TURNTABLE_SPEED = 1004, IDC_BK_ASPECT_MIN = 1005, IDC_BK_ASPECT_MAX = 1006, IDC_PROVIDER_LIST = 1010 };
 
     HWND m_parent;
     preferences_page_callback::ptr m_callback;
@@ -167,6 +175,10 @@ private:
     HWND m_turntableSpeedEdit;
     HWND m_bkAspectMinEdit;
     HWND m_bkAspectMaxEdit;
+    HWND m_providerList;
+    int  m_dragSrc;
+    int  m_dragDst;
+    bool m_dragging;
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* self = reinterpret_cast<DanmakuPreferencesInstance*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
@@ -176,10 +188,52 @@ private:
             SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
-        if (self && msg == WM_COMMAND &&
-            (LOWORD(wp) == IDC_INTERVAL || LOWORD(wp) == IDC_TRACKS || LOWORD(wp) == IDC_SPEED || LOWORD(wp) == IDC_TURNTABLE_SPEED || LOWORD(wp) == IDC_BK_ASPECT_MIN || LOWORD(wp) == IDC_BK_ASPECT_MAX) &&
+        if (!self) return DefWindowProcW(hwnd, msg, wp, lp);
+
+        if (msg == WM_COMMAND &&
+            (LOWORD(wp) == IDC_INTERVAL || LOWORD(wp) == IDC_TRACKS || LOWORD(wp) == IDC_SPEED ||
+             LOWORD(wp) == IDC_TURNTABLE_SPEED || LOWORD(wp) == IDC_BK_ASPECT_MIN ||
+             LOWORD(wp) == IDC_BK_ASPECT_MAX) &&
             HIWORD(wp) == EN_CHANGE) {
             if (self->m_callback.is_valid()) self->m_callback->on_state_changed();
+            return 0;
+        }
+
+        /* ── ListView drag-to-reorder ── */
+        if (msg == WM_NOTIFY) {
+            auto* nm = reinterpret_cast<NMHDR*>(lp);
+            if (nm->hwndFrom == self->m_providerList && nm->code == LVN_BEGINDRAG) {
+                auto* nmlv = reinterpret_cast<NMLISTVIEW*>(lp);
+                self->m_dragSrc = nmlv->iItem;
+                self->m_dragDst = nmlv->iItem;
+                self->m_dragging = true;
+                SetCapture(hwnd);
+                return 0;
+            }
+        }
+        if (msg == WM_MOUSEMOVE && self->m_dragging) {
+            POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            MapWindowPoints(hwnd, self->m_providerList, &pt, 1);
+            LVHITTESTINFO ht = {};
+            ht.pt = pt;
+            int idx = ListView_HitTest(self->m_providerList, &ht);
+            int total = ListView_GetItemCount(self->m_providerList);
+            int dst = (idx >= 0) ? idx : (pt.y < 0 ? 0 : total - 1);
+            if (dst != self->m_dragDst) {
+                self->m_dragDst = dst;
+                LVINSERTMARK lim = { sizeof(LVINSERTMARK), 0, dst, 0 };
+                ListView_SetInsertMark(self->m_providerList, &lim);
+            }
+            return 0;
+        }
+        if (msg == WM_LBUTTONUP && self->m_dragging) {
+            self->m_dragging = false;
+            ReleaseCapture();
+            ListView_SetInsertMark(self->m_providerList, nullptr);
+            if (self->m_dragSrc != self->m_dragDst) {
+                self->moveListItem(self->m_dragSrc, self->m_dragDst);
+                if (self->m_callback.is_valid()) self->m_callback->on_state_changed();
+            }
             return 0;
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -276,6 +330,28 @@ private:
         writeTurntableSpeed(danmaku_get_turntable_speed_percent());
         writeBkAspectMin(danmaku_get_bk_aspect_min_tenths());
         writeBkAspectMax(danmaku_get_bk_aspect_max_tenths());
+
+        /* ── Provider priority section ── */
+        CreateWindowExW(0, L"STATIC",
+            L"Music Provider Priority (drag rows to reorder; top = first tried):",
+            WS_CHILD | WS_VISIBLE,
+            12, 338, 600, 20, m_wnd, nullptr, inst, nullptr);
+
+        m_providerList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEW, L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+            LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER,
+            12, 362, 380, 110, m_wnd,
+            (HMENU)(INT_PTR)IDC_PROVIDER_LIST, inst, nullptr);
+
+        ListView_SetExtendedListViewStyle(m_providerList,
+            LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+
+        LVCOLUMNW col = {};
+        col.mask = LVCF_WIDTH;
+        col.cx   = 356;
+        ListView_InsertColumn(m_providerList, 0, &col);
+
+        populateProviderList();
     }
 
     int readInt(HWND edit, int defaultValue, int (*clampFn)(int)) const {
@@ -318,12 +394,91 @@ private:
     }
 
     bool hasChanged() const {
-        return readInt(m_intervalEdit, kDefaultSpawnIntervalMs, clamp_interval) != danmaku_get_spawn_interval_ms() ||
-               readInt(m_tracksEdit, kDefaultTrackCount, clamp_tracks) != danmaku_get_track_count() ||
-               readInt(m_speedEdit, kDefaultSpeedPercent, clamp_speed) != danmaku_get_speed_percent() ||
-               readInt(m_turntableSpeedEdit, kDefaultTurntableSpeedPercent, clamp_turntable_speed) != danmaku_get_turntable_speed_percent() ||
-               readInt(m_bkAspectMinEdit, kDefaultBkAspectMinTenths, clamp_bk_aspect) != danmaku_get_bk_aspect_min_tenths() ||
-               readInt(m_bkAspectMaxEdit, kDefaultBkAspectMaxTenths, clamp_bk_aspect) != danmaku_get_bk_aspect_max_tenths();
+        if (readInt(m_intervalEdit, kDefaultSpawnIntervalMs, clamp_interval) != danmaku_get_spawn_interval_ms() ||
+            readInt(m_tracksEdit, kDefaultTrackCount, clamp_tracks)           != danmaku_get_track_count()        ||
+            readInt(m_speedEdit, kDefaultSpeedPercent, clamp_speed)           != danmaku_get_speed_percent()      ||
+            readInt(m_turntableSpeedEdit, kDefaultTurntableSpeedPercent, clamp_turntable_speed)
+                != danmaku_get_turntable_speed_percent() ||
+            readInt(m_bkAspectMinEdit, kDefaultBkAspectMinTenths, clamp_bk_aspect)
+                != danmaku_get_bk_aspect_min_tenths() ||
+            readInt(m_bkAspectMaxEdit, kDefaultBkAspectMaxTenths, clamp_bk_aspect)
+                != danmaku_get_bk_aspect_max_tenths())
+            return true;
+        /* Check whether the provider order in the ListView differs from g_music. */
+        if (!g_music || !m_providerList) return false;
+        int n = music_client_get_provider_count(g_music);
+        if (ListView_GetItemCount(m_providerList) != n) return true;
+        for (int i = 0; i < n; i++) {
+            wchar_t buf[MAX_PATH] = {};
+            LVITEMW li = {};
+            li.mask = LVIF_TEXT; li.iItem = i; li.pszText = buf; li.cchTextMax = MAX_PATH;
+            ListView_GetItem(m_providerList, &li);
+            const wchar_t* cur = music_client_get_provider_path(g_music, i);
+            if (!cur) return true;
+            const wchar_t* fn = wcsrchr(cur, L'\\');
+            if (fn) fn++; else fn = cur;
+            if (_wcsicmp(buf, fn) != 0) return true;
+        }
+        return false;
+    }
+
+    /* ── provider list helpers ── */
+
+    void populateProviderList() {
+        if (!m_providerList) return;
+        ListView_DeleteAllItems(m_providerList);
+        if (!g_music) return;
+        int n = music_client_get_provider_count(g_music);
+        for (int i = 0; i < n; i++) {
+            const wchar_t* path = music_client_get_provider_path(g_music, i);
+            if (!path) continue;
+            const wchar_t* fn = wcsrchr(path, L'\\');
+            const wchar_t* name = fn ? fn + 1 : path;
+            LVITEMW li = {};
+            li.mask    = LVIF_TEXT;
+            li.iItem   = i;
+            li.pszText = const_cast<wchar_t*>(name);
+            ListView_InsertItem(m_providerList, &li);
+        }
+    }
+
+    void moveListItem(int src, int dst) {
+        if (!m_providerList || src == dst) return;
+        wchar_t buf[MAX_PATH] = {};
+        LVITEMW li = {};
+        li.mask = LVIF_TEXT; li.iItem = src; li.pszText = buf; li.cchTextMax = MAX_PATH;
+        ListView_GetItem(m_providerList, &li);
+        std::wstring text = buf;
+        ListView_DeleteItem(m_providerList, src);
+        LVITEMW ins = {};
+        ins.mask    = LVIF_TEXT;
+        ins.iItem   = dst;
+        ins.pszText = const_cast<wchar_t*>(text.c_str());
+        ListView_InsertItem(m_providerList, &ins);
+        ListView_SetItemState(m_providerList, dst,
+            LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    }
+
+    void applyProviderOrder() {
+        if (!g_music || !m_providerList) return;
+        int n     = ListView_GetItemCount(m_providerList);
+        int total = music_client_get_provider_count(g_music);
+        if (n != total) return;
+        std::vector<std::wstring> ordered;
+        for (int i = 0; i < n; i++) {
+            wchar_t buf[MAX_PATH] = {};
+            LVITEMW li = {};
+            li.mask = LVIF_TEXT; li.iItem = i; li.pszText = buf; li.cchTextMax = MAX_PATH;
+            ListView_GetItem(m_providerList, &li);
+            for (int j = 0; j < total; j++) {
+                const wchar_t* path = music_client_get_provider_path(g_music, j);
+                if (!path) continue;
+                const wchar_t* fn = wcsrchr(path, L'\\');
+                const wchar_t* name = fn ? fn + 1 : path;
+                if (_wcsicmp(buf, name) == 0) { ordered.push_back(path); break; }
+            }
+        }
+        save_provider_order(ordered);
     }
 };
 
