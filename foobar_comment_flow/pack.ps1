@@ -1,7 +1,7 @@
 param(
+    [string]$Version  = "2.0.2",
     [ValidateSet("x64","Win32")]
-    [string]$Platform = "x64",
-    [string]$Version  = "2.0.2"
+    [string]$Platform = "x64"   # 仅用于选择构建产物来源，不影响包内结构
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,31 +26,17 @@ Write-Host "Packaging $COMPONENT_NAME v$Version ($Platform) ..."
 # Use a temp subfolder so we don't accidentally include stale files.
 $stage = "$env:TEMP\fb2k_pack_$COMPONENT_NAME"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
-New-Item -ItemType Directory -Path $stage          | Out-Null
-New-Item -ItemType Directory -Path "$stage\$Platform" | Out-Null
+New-Item -ItemType Directory -Path $stage | Out-Null
 
 # ── Copy payload ───────────────────────────────────────
-# foobar2000 packaging spec (multi-arch):
-#
-#   root\               <- foobar2000 识别组件的基准层，必须有 DLL
-#     foo_danmaku.dll
-#     netease_client.dll
-#   x64\                <- x64 foobar2000 用此层覆盖根目录版本
-#     foo_danmaku.dll
-#     netease_client.dll
-#
-# 根目录为空时 foobar2000 无法识别组件（安装 0 个组件）。
-# 由于我们只有 x64 构建，根目录和 x64\ 放同一份 DLL 即可。
+# foobar2000 直接识别 zip 根目录下的 DLL 作为组件。
+# 只需将两个 DLL 放根目录即可，无需架构子目录。
 
 Copy-Item $FOO_DANMAKU_DLL "$stage\foo_danmaku.dll"
 Copy-Item $NETEASE_DLL     "$stage\netease_client.dll"
-Copy-Item $FOO_DANMAKU_DLL "$stage\$Platform\foo_danmaku.dll"
-Copy-Item $NETEASE_DLL     "$stage\$Platform\netease_client.dll"
 
-Write-Host "  -> foo_danmaku.dll          (root)"
-Write-Host "  -> netease_client.dll       (root)"
-Write-Host "  -> $Platform\foo_danmaku.dll    (arch override)"
-Write-Host "  -> $Platform\netease_client.dll (arch override)"
+Write-Host "  -> foo_danmaku.dll"
+Write-Host "  -> netease_client.dll"
 
 # ── Create zip and rename to .fb2k-component ──────────
 if (-not (Test-Path $DIST)) { New-Item -ItemType Directory -Path $DIST | Out-Null }
