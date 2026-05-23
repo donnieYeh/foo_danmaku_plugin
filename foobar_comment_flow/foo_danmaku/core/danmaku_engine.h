@@ -103,6 +103,7 @@ private:
     bool createD2DTarget();
     void discardD2DTarget();
     void shutdownD2D();
+    void rebuildDWriteTextFormat();
     void rebuildD2DCoverIfNeeded();
     ID2D1Bitmap* createD2DBitmapFromHBITMAP(HBITMAP bitmap);
     void drawSoftBackgroundD2D();
@@ -115,5 +116,6 @@ private:
 };
 
 #endif // DANMAKU_ENGINE_H
+
 
 

@@ -75,20 +75,7 @@ void DanmakuEngine::init(HWND parentWnd) {
     if (FAILED(hr)) {
         engine_log("[Danmaku/engine] DWrite factory creation failed hr=0x%08x", (unsigned)hr);
     }
-    if (m_dwriteFactory) {
-        hr = m_dwriteFactory->CreateTextFormat(
-            L"Microsoft YaHei", nullptr,
-            DWRITE_FONT_WEIGHT_BOLD,
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            40.0f,
-            L"zh-cn",
-            &m_dwriteTextFormat);
-        if (SUCCEEDED(hr) && m_dwriteTextFormat) {
-            m_dwriteTextFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-            m_dwriteTextFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-        }
-    }
+    rebuildDWriteTextFormat();
 
     HDC hdc = GetDC(m_hwnd);
     if (!hdc) hdc = GetDC(nullptr); // fallback to screen DC
@@ -470,6 +457,7 @@ void DanmakuEngine::resize(int width, int height) {
     m_font = CreateFontW(fontSize, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
+    rebuildDWriteTextFormat();
 }
 
 void DanmakuEngine::updateDanmakuPositions(float deltaSeconds) {
@@ -482,6 +470,27 @@ void DanmakuEngine::updateDanmakuPositions(float deltaSeconds) {
 
 float DanmakuEngine::measureTextWidth(const std::wstring& text) const {
     if (text.empty()) return 0.0f;
+
+    if (m_dwriteFactory && m_dwriteTextFormat) {
+        IDWriteTextLayout* layout = nullptr;
+        HRESULT hr = m_dwriteFactory->CreateTextLayout(
+            text.c_str(),
+            (UINT32)text.length(),
+            m_dwriteTextFormat,
+            4096.0f,
+            256.0f,
+            &layout);
+        if (SUCCEEDED(hr) && layout) {
+            DWRITE_TEXT_METRICS metrics = {};
+            hr = layout->GetMetrics(&metrics);
+            releaseCom(layout);
+            if (SUCCEEDED(hr) && metrics.widthIncludingTrailingWhitespace > 0.0f) {
+                return metrics.widthIncludingTrailingWhitespace;
+            }
+        } else {
+            releaseCom(layout);
+        }
+    }
 
     HDC dc = m_memDC;
     HDC tempDC = nullptr;
@@ -510,7 +519,6 @@ float DanmakuEngine::measureTextWidth(const std::wstring& text) const {
     }
     return (float)sz.cx;
 }
-
 void DanmakuEngine::drawSoftBackground(HDC dc) {
     if (!dc || m_width <= 0 || m_height <= 0) return;
 
@@ -944,6 +952,7 @@ bool DanmakuEngine::createD2DTarget() {
         return false;
     }
     m_d2dTarget->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    engine_log("[Danmaku/engine] D2D DC render target created %ux%u", (unsigned)w, (unsigned)h);
     return true;
 }
 
@@ -1118,5 +1127,25 @@ void DanmakuEngine::drawDanmakuD2D() {
 
 
 
+
+
+
+void DanmakuEngine::rebuildDWriteTextFormat() {
+    releaseCom(m_dwriteTextFormat);
+    if (!m_dwriteFactory) return;
+    float fontPx = (m_height > 0) ? (float)std::max(28, std::min(64, m_height / 4)) : 40.0f;
+    HRESULT hr = m_dwriteFactory->CreateTextFormat(
+        L"Microsoft YaHei", nullptr,
+        DWRITE_FONT_WEIGHT_BOLD,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        fontPx,
+        L"zh-cn",
+        &m_dwriteTextFormat);
+    if (SUCCEEDED(hr) && m_dwriteTextFormat) {
+        m_dwriteTextFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        m_dwriteTextFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    }
+}
 
 
