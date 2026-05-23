@@ -1,6 +1,8 @@
-#include "danmaku_engine.h"
+﻿#include "danmaku_engine.h"
 #include <windows.h>
 #include <gdiplus.h>
+#include <d2d1.h>
+#include <dwrite.h>
 #include <cmath>
 #include <algorithm>
 #include <utility>  // std::min / std::max
@@ -8,8 +10,10 @@
 #include <vector>
 
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
 
-// UI translation unit provides this — routes to foobar console + OutputDebugString.
+// UI translation unit provides this 鈥?routes to foobar console + OutputDebugString.
 // Declared extern here so we don't need to pull in fb2k SDK headers from engine.
 extern "C" void danmaku_log_external(const char* msg);
 
@@ -32,9 +36,20 @@ static void engine_log(const char* fmt, ...) {
     danmaku_log_external(buf);
 }
 
+template <typename T>
+static void releaseCom(T*& p) {
+    if (p) {
+        p->Release();
+        p = nullptr;
+    }
+}
+
 DanmakuEngine::DanmakuEngine()
     : m_hwnd(nullptr), m_memDC(nullptr), m_memBM(nullptr)
     , m_font(nullptr), m_coverBitmap(nullptr), m_coverBitmapW(0), m_coverBitmapH(0)
+    , m_d2dFactory(nullptr), m_dwriteFactory(nullptr)
+    , m_d2dTarget(nullptr), m_dwriteTextFormat(nullptr)
+    , m_coverD2DBitmap(nullptr), m_coverD2DDirty(true)
     , m_width(0), m_height(0), m_recordAngle(0.0f)
     , m_armLanded(false), m_armProgress(0.0f)
     , m_poolIndex(0)
@@ -49,6 +64,31 @@ DanmakuEngine::~DanmakuEngine() {
 
 void DanmakuEngine::init(HWND parentWnd) {
     m_hwnd = parentWnd;
+
+    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &m_d2dFactory);
+    if (FAILED(hr)) {
+        engine_log("[Danmaku/engine] D2D factory creation failed hr=0x%08x", (unsigned)hr);
+    }
+    hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+        __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(&m_dwriteFactory));
+    if (FAILED(hr)) {
+        engine_log("[Danmaku/engine] DWrite factory creation failed hr=0x%08x", (unsigned)hr);
+    }
+    if (m_dwriteFactory) {
+        hr = m_dwriteFactory->CreateTextFormat(
+            L"Microsoft YaHei", nullptr,
+            DWRITE_FONT_WEIGHT_BOLD,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            40.0f,
+            L"zh-cn",
+            &m_dwriteTextFormat);
+        if (SUCCEEDED(hr) && m_dwriteTextFormat) {
+            m_dwriteTextFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            m_dwriteTextFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        }
+    }
 
     HDC hdc = GetDC(m_hwnd);
     if (!hdc) hdc = GetDC(nullptr); // fallback to screen DC
@@ -66,14 +106,16 @@ void DanmakuEngine::init(HWND parentWnd) {
     m_trackUsage.resize(m_config.maxTracks, 0);
     m_trackRightEdge.assign(m_config.maxTracks, -1e9f);
 
-    // 创建字体一次，后续复用，不再每帧 CreateFont
+    // 鍒涘缓瀛椾綋涓€娆★紝鍚庣画澶嶇敤锛屼笉鍐嶆瘡甯?CreateFont
     m_font = CreateFontW(40, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
 }
 
 void DanmakuEngine::shutdown() {
-    // 先把字体从 DC 中 deselect，再删除
+    shutdownD2D();
+
+    // 鍏堟妸瀛椾綋浠?DC 涓?deselect锛屽啀鍒犻櫎
     if (m_memDC && m_font) {
         SelectObject(m_memDC, GetStockObject(SYSTEM_FONT));
     }
@@ -106,6 +148,8 @@ void DanmakuEngine::setCoverArt(HBITMAP bitmap) {
         m_coverBitmapW = 0;
         m_coverBitmapH = 0;
     }
+    releaseCom(m_coverD2DBitmap);
+    m_coverD2DDirty = true;
     m_coverBitmap = bitmap;
     if (m_coverBitmap) {
         BITMAP bm = {};
@@ -172,7 +216,7 @@ void DanmakuEngine::addDanmaku(const std::wstring& text, COLORREF color) {
 
     int track = pickTrackForSpawn();
     if (track < 0) {
-        // No track has clearance — try least-used as fallback (overlap acceptable).
+        // No track has clearance 鈥?try least-used as fallback (overlap acceptable).
         track = allocateTrack();
     } else {
         m_trackUsage[track]++; // pickTrackForSpawn doesn't bump usage itself
@@ -240,29 +284,53 @@ int DanmakuEngine::poolRemaining() const {
 void DanmakuEngine::onPaint(HDC hdc) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    if (!m_memDC || !m_memBM) return;
+    if (m_hwnd) {
+        RECT rc = {};
+        if (GetClientRect(m_hwnd, &rc)) {
+            int cw = std::max<LONG>(1, rc.right - rc.left);
+            int ch = std::max<LONG>(1, rc.bottom - rc.top);
+            if (m_width != cw || m_height != ch) {
+                m_width = cw;
+                m_height = ch;
+            }
+        }
+    }
 
+    if (createD2DTarget() && m_d2dTarget) {
+        RECT bindRc = {0, 0, m_width, m_height};
+        HRESULT bindHr = m_d2dTarget->BindDC(hdc, &bindRc);
+        if (FAILED(bindHr)) { discardD2DTarget(); return; }
+        rebuildD2DCoverIfNeeded();
+        m_d2dTarget->BeginDraw();
+        m_d2dTarget->PushAxisAlignedClip(
+            D2D1::RectF(0, 0, (FLOAT)m_width, (FLOAT)m_height),
+            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        drawSoftBackgroundD2D();
+        drawTurntableD2D();
+        drawDanmakuD2D();
+        m_d2dTarget->PopAxisAlignedClip();
+        HRESULT hr = m_d2dTarget->EndDraw();
+        if (hr == D2DERR_RECREATE_TARGET) {
+            discardD2DTarget();
+        }
+        return;
+    }
+
+    if (!m_memDC || !m_memBM) return;
     drawSoftBackground(m_memDC);
     drawTurntable(m_memDC);
-
     if (m_config.enabled && m_font) {
         HGDIOBJ oldFont = SelectObject(m_memDC, m_font);
         SetBkMode(m_memDC, TRANSPARENT);
-
         for (const auto& item : m_danmakuList) {
             if (!item.active) continue;
             SetTextColor(m_memDC, item.color);
-            TextOutW(m_memDC, (int)item.x, (int)item.y,
-                     item.text.c_str(), (int)item.text.length());
+            TextOutW(m_memDC, (int)item.x, (int)item.y, item.text.c_str(), (int)item.text.length());
         }
-
         SelectObject(m_memDC, oldFont);
     }
-
-    // Single atomic blit to screen — the only on-screen draw this frame.
     BitBlt(hdc, 0, 0, m_width, m_height, m_memDC, 0, 0, SRCCOPY);
 }
-
 void DanmakuEngine::onTimer() {
     std::lock_guard<std::mutex> lock(m_mutex);
     DWORD now = GetTickCount();
@@ -277,12 +345,12 @@ void DanmakuEngine::onTimer() {
     m_subpixelRemainderMs = deltaPreciseMs - floor(deltaPreciseMs);
     float deltaSeconds = (float)(deltaPreciseMs / 1000.0);
 
-    // Arm landing easing — runs in both paused and playing state so the arm
+    // Arm landing easing 鈥?runs in both paused and playing state so the arm
     // can smoothly lift away when playback stops.
     {
         float target = m_armLanded ? 1.0f : 0.0f;
         float diff = target - m_armProgress;
-        // Exponential ease — visually smooth, framerate-independent.
+        // Exponential ease 鈥?visually smooth, framerate-independent.
         float k = 1.0f - expf(-deltaSeconds * 4.5f);
         m_armProgress += diff * k;
         if (fabsf(diff) < 0.001f) m_armProgress = target;
@@ -373,8 +441,8 @@ void DanmakuEngine::resize(int width, int height) {
 
     m_width  = width;
     m_height = height;
-
-    // 先将字体从 DC 中 deselect，然后释放旧资源
+    
+    // 鍏堝皢瀛椾綋浠?DC 涓?deselect锛岀劧鍚庨噴鏀炬棫璧勬簮
     if (m_memDC && m_font)
         SelectObject(m_memDC, GetStockObject(SYSTEM_FONT));
 
@@ -382,7 +450,7 @@ void DanmakuEngine::resize(int width, int height) {
     if (m_memDC) { DeleteDC(m_memDC);     m_memDC = nullptr; }
 
     HDC hdc = GetDC(m_hwnd);
-    if (!hdc) hdc = GetDC(nullptr); // fallback：用屏幕 DC 也能创建兼容 DC
+    if (!hdc) hdc = GetDC(nullptr); // fallback锛氱敤灞忓箷 DC 涔熻兘鍒涘缓鍏煎 DC
     m_memDC = CreateCompatibleDC(hdc);
     m_memBM = CreateCompatibleBitmap(hdc, width, height);
     ReleaseDC(m_hwnd, hdc);
@@ -390,13 +458,13 @@ void DanmakuEngine::resize(int width, int height) {
     if (m_memDC && m_memBM) {
         SelectObject(m_memDC, m_memBM);
     } else {
-        // 创建失败时清理，避免悬空指针
+        // 鍒涘缓澶辫触鏃舵竻鐞嗭紝閬垮厤鎮┖鎸囬拡
         if (m_memBM) { DeleteObject(m_memBM); m_memBM = nullptr; }
         if (m_memDC) { DeleteDC(m_memDC);     m_memDC = nullptr; }
         return;
     }
 
-    // resize 后重建字体（字号跟随高度缩放，放大一倍）
+    // resize 鍚庨噸寤哄瓧浣擄紙瀛楀彿璺熼殢楂樺害缂╂斁锛屾斁澶т竴鍊嶏級
     if (m_font) { DeleteObject(m_font); m_font = nullptr; }
     int fontSize = std::max(28, std::min(64, height / 4));
     m_font = CreateFontW(fontSize, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
@@ -534,7 +602,7 @@ void DanmakuEngine::drawTurntable(HDC dc) {
     int cy = (int)(m_height * 0.47f);
     if (m_height < 220) cy = m_height / 2;
 
-    // ── Record shadow / seat ────────────────────────────────────────
+    // 鈹€鈹€ Record shadow / seat 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     // No glow/halo: just a controlled shadow between the outer contour and vinyl.
     for (int k = 12; k >= 2; k -= 2) {
         COLORREF c = RGB(18 + k, 20 + k, 23 + k);
@@ -550,7 +618,7 @@ void DanmakuEngine::drawTurntable(HDC dc) {
         DeleteObject(pen);
     }
 
-    // ── Black vinyl disc ─────────────────────────────────────────────
+    // 鈹€鈹€ Black vinyl disc 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     HBRUSH vinyl = CreateSolidBrush(RGB(16, 17, 17));
     HPEN rimPen = CreatePen(PS_SOLID, 2, RGB(4, 5, 7));
     HGDIOBJ oldB = SelectObject(dc, vinyl);
@@ -572,7 +640,7 @@ void DanmakuEngine::drawTurntable(HDC dc) {
         DeleteObject(groove);
     }
 
-    // ── Center label / album art ─────────────────────────────────────
+    // 鈹€鈹€ Center label / album art 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     // Cover is intentionally large, matching the reference's prominent center
     // image while still leaving a substantial black vinyl ring.
     int labelR = std::max(28, (int)(recordR * 0.68f));
@@ -626,7 +694,7 @@ void DanmakuEngine::drawTurntable(HDC dc) {
     SelectObject(dc, oldH);
     DeleteObject(hole);
 
-    // ── Tone arm — animated landing, polished detail ────────────────
+    // 鈹€鈹€ Tone arm 鈥?animated landing, polished detail 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     // Pivot anchored to the upper-right of the disc, similar to the
     // reference NetEase Cloud Music player. The arm sweeps in/out around
     // this pivot driven by m_armProgress (0=parked off-disc, 1=landed).
@@ -672,7 +740,7 @@ void DanmakuEngine::drawTurntable(HDC dc) {
     SelectObject(dc, oldPen);
     DeleteObject(shadowPen);
 
-    // Main arm — two slightly different thicknesses for a tapered look.
+    // Main arm 鈥?two slightly different thicknesses for a tapered look.
     HPEN armPen1 = CreatePen(PS_SOLID, armThick, RGB(238, 236, 230));
     oldPen = SelectObject(dc, armPen1);
     MoveToEx(dc, pivotX, pivotY, nullptr);
@@ -758,7 +826,7 @@ void DanmakuEngine::drawTurntable(HDC dc) {
 }
 
 int DanmakuEngine::allocateTrack() {
-    if (m_trackUsage.empty()) return 0; // 防止空数组越界
+    if (m_trackUsage.empty()) return 0; // 闃叉绌烘暟缁勮秺鐣?
 
     int track = 0;
     int minUsage = m_trackUsage[0];
@@ -776,7 +844,9 @@ int DanmakuEngine::allocateTrack() {
 
 void DanmakuEngine::setHwnd(HWND hwnd) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_hwnd == hwnd) return;
     m_hwnd = hwnd;
+    discardD2DTarget();
 }
 
 void DanmakuEngine::recycleTrack(int track) {
@@ -821,7 +891,7 @@ void DanmakuEngine::dripFromPool() {
     }
 
     int track = pickTrackForSpawn();
-    if (track < 0) return; // no lane ready yet — wait for items to scroll left
+    if (track < 0) return; // no lane ready yet 鈥?wait for items to scroll left
 
     const PooledComment& pc = m_pool[m_poolIndex];
     m_poolIndex = (m_poolIndex + 1) % m_pool.size(); // wrap = loop
@@ -851,3 +921,202 @@ void DanmakuEngine::dripFromPool() {
     m_danmakuList.push_back(item);
     m_lastSpawnTick = now;
 }
+
+bool DanmakuEngine::createD2DTarget() {
+    if (m_d2dTarget) return true;
+    if (!m_d2dFactory || !m_hwnd || m_width <= 0 || m_height <= 0) return false;
+
+    RECT rc = {};
+    GetClientRect(m_hwnd, &rc);
+    UINT32 w = (UINT32)std::max<LONG>(1, rc.right - rc.left);
+    UINT32 h = (UINT32)std::max<LONG>(1, rc.bottom - rc.top);
+    m_width = (int)w;
+    m_height = (int)h;
+
+    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+    HRESULT hr = m_d2dFactory->CreateDCRenderTarget(&props, &m_d2dTarget);
+
+    if (FAILED(hr)) {
+        engine_log("[Danmaku/engine] D2D target creation failed hr=0x%08x", (unsigned)hr);
+        m_d2dTarget = nullptr;
+        return false;
+    }
+    m_d2dTarget->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    return true;
+}
+
+void DanmakuEngine::discardD2DTarget() {
+    releaseCom(m_d2dTarget);
+}
+
+void DanmakuEngine::shutdownD2D() {
+    discardD2DTarget();
+    releaseCom(m_dwriteTextFormat);
+    releaseCom(m_dwriteFactory);
+    releaseCom(m_d2dFactory);
+}
+
+
+
+static D2D1_COLOR_F d2dFromColorRef(COLORREF c, float a = 1.0f) {
+    return D2D1::ColorF(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f, GetBValue(c) / 255.0f, a);
+}
+
+ID2D1Bitmap* DanmakuEngine::createD2DBitmapFromHBITMAP(HBITMAP bitmap) {
+    if (!m_d2dTarget || !bitmap) return nullptr;
+    Gdiplus::Bitmap gdip(bitmap, nullptr);
+    if (gdip.GetLastStatus() != Gdiplus::Ok) return nullptr;
+    Gdiplus::Rect rect(0, 0, (INT)gdip.GetWidth(), (INT)gdip.GetHeight());
+    Gdiplus::BitmapData data = {};
+    if (gdip.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppPARGB, &data) != Gdiplus::Ok) return nullptr;
+    ID2D1Bitmap* out = nullptr;
+    D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    HRESULT hr = m_d2dTarget->CreateBitmap(D2D1::SizeU((UINT32)data.Width, (UINT32)data.Height),
+        data.Scan0, (UINT32)data.Stride, &props, &out);
+    gdip.UnlockBits(&data);
+    return SUCCEEDED(hr) ? out : nullptr;
+}
+
+void DanmakuEngine::rebuildD2DCoverIfNeeded() {
+    if (!m_coverD2DDirty) return;
+    releaseCom(m_coverD2DBitmap);
+    if (m_coverBitmap) m_coverD2DBitmap = createD2DBitmapFromHBITMAP(m_coverBitmap);
+    m_coverD2DDirty = false;
+}
+
+void DanmakuEngine::drawSoftBackgroundD2D() {
+    if (!m_d2dTarget) return;
+    ID2D1GradientStopCollection* stops = nullptr;
+    ID2D1LinearGradientBrush* grad = nullptr;
+    D2D1_GRADIENT_STOP gs[3] = {
+        {0.0f, d2dFromColorRef(RGB(62,64,64))},
+        {0.55f, d2dFromColorRef(RGB(45,47,47))},
+        {1.0f, d2dFromColorRef(RGB(28,30,30))}
+    };
+    if (SUCCEEDED(m_d2dTarget->CreateGradientStopCollection(gs, 3, &stops)) &&
+        SUCCEEDED(m_d2dTarget->CreateLinearGradientBrush(
+            D2D1::LinearGradientBrushProperties(D2D1::Point2F(0,0), D2D1::Point2F(0,(FLOAT)m_height)), stops, &grad))) {
+        m_d2dTarget->FillRectangle(D2D1::RectF(0,0,(FLOAT)m_width,(FLOAT)m_height), grad);
+    } else {
+        m_d2dTarget->Clear(d2dFromColorRef(RGB(36,38,40)));
+    }
+    releaseCom(grad); releaseCom(stops);
+    if (m_coverD2DBitmap) {
+        D2D1_SIZE_F sz = m_coverD2DBitmap->GetSize();
+        float scale = std::max((float)m_width / sz.width, (float)m_height / sz.height);
+        float dw = sz.width * scale, dh = sz.height * scale;
+        D2D1_RECT_F dst = D2D1::RectF((m_width-dw)*0.5f, (m_height-dh)*0.5f, (m_width+dw)*0.5f, (m_height+dh)*0.5f);
+        m_d2dTarget->DrawBitmap(m_coverD2DBitmap, dst, 0.18f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        ID2D1SolidColorBrush* veil = nullptr;
+        if (SUCCEEDED(m_d2dTarget->CreateSolidColorBrush(D2D1::ColorF(0.08f,0.09f,0.10f,0.58f), &veil))) {
+            m_d2dTarget->FillRectangle(D2D1::RectF(0,0,(FLOAT)m_width,(FLOAT)m_height), veil);
+        }
+        releaseCom(veil);
+    }
+}
+
+void DanmakuEngine::drawTurntableD2D() {
+    if (!m_d2dTarget || m_width <= 80 || m_height <= 80) return;
+    int panelMin = std::min(m_width, m_height);
+    int recordR = std::min(std::max(48, (int)(panelMin * 0.36f)), std::min((int)(m_width*0.42f), (int)(m_height*0.42f)));
+    float cx = m_width * 0.5f;
+    float cy = (m_height < 220) ? m_height * 0.5f : m_height * 0.47f;
+    ID2D1SolidColorBrush* b = nullptr;
+    if (FAILED(m_d2dTarget->CreateSolidColorBrush(D2D1::ColorF(0,0,0,1), &b))) return;
+    for (int k=12;k>=2;k-=2) { b->SetColor(D2D1::ColorF(0,0,0,0.05f+k*0.006f)); m_d2dTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx,cy+6), recordR+(FLOAT)k, recordR+(FLOAT)k), b); }
+    b->SetColor(d2dFromColorRef(RGB(16,17,17))); m_d2dTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx,cy),(FLOAT)recordR,(FLOAT)recordR), b);
+    b->SetColor(d2dFromColorRef(RGB(4,5,7))); m_d2dTarget->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx,cy),(FLOAT)recordR,(FLOAT)recordR), b, 2.0f);
+    for (int r=recordR-7;r>recordR/2;r-=5) { int shade=24+((recordR-r)%18); b->SetColor(d2dFromColorRef(RGB(shade,shade,shade),0.75f)); m_d2dTarget->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx,cy),(FLOAT)r,(FLOAT)r), b, 1.0f); }
+    int labelR = std::max(28, (int)(recordR*0.68f));
+    if (m_coverD2DBitmap) {
+        ID2D1EllipseGeometry* clip = nullptr; ID2D1Layer* layer = nullptr;
+        if (m_d2dFactory && SUCCEEDED(m_d2dFactory->CreateEllipseGeometry(D2D1::Ellipse(D2D1::Point2F(cx,cy),(FLOAT)labelR,(FLOAT)labelR), &clip)) && SUCCEEDED(m_d2dTarget->CreateLayer(nullptr, &layer))) {
+            m_d2dTarget->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), clip), layer);
+        }
+        D2D1_SIZE_F sz = m_coverD2DBitmap->GetSize();
+        D2D1_MATRIX_3X2_F old; m_d2dTarget->GetTransform(&old);
+        m_d2dTarget->SetTransform(D2D1::Matrix3x2F::Rotation(m_recordAngle*57.2957795f, D2D1::Point2F(cx,cy)) * old);
+        m_d2dTarget->DrawBitmap(m_coverD2DBitmap, D2D1::RectF(cx-labelR,cy-labelR,cx+labelR,cy+labelR), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1::RectF(0,0,sz.width,sz.height));
+        m_d2dTarget->SetTransform(old);
+        if (layer) { m_d2dTarget->PopLayer(); releaseCom(layer); } releaseCom(clip);
+        b->SetColor(d2dFromColorRef(RGB(20,18,16))); m_d2dTarget->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx,cy),(FLOAT)labelR,(FLOAT)labelR), b, 2.0f);
+    } else { b->SetColor(d2dFromColorRef(RGB(118,122,128))); m_d2dTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx,cy),(FLOAT)labelR,(FLOAT)labelR), b); }
+    b->SetColor(d2dFromColorRef(RGB(6,7,8))); m_d2dTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx,cy),5,5), b);
+    int pivotX=(int)(cx+recordR*1.12f), pivotY=(int)(cy-recordR*0.98f), armLen=(int)(recordR*0.84f);
+    float pe=m_armProgress*m_armProgress*(3.0f-2.0f*m_armProgress), angle=1.30f+(1.736f-1.30f)*pe;
+    float dirX=cosf(angle), dirY=sinf(angle); int jointX=pivotX+(int)(dirX*armLen*0.62f), jointY=pivotY+(int)(dirY*armLen*0.62f);
+    float bendAngle=angle+0.30f; int headX=jointX+(int)(cosf(bendAngle)*armLen*0.42f), headY=jointY+(int)(sinf(bendAngle)*armLen*0.42f);
+    float armThick=(float)std::max(4,recordR/22), armThin=(float)std::max(3,recordR/28);
+    b->SetColor(D2D1::ColorF(0,0,0,0.24f)); m_d2dTarget->DrawLine(D2D1::Point2F((FLOAT)pivotX+2,(FLOAT)pivotY+3),D2D1::Point2F((FLOAT)jointX+2,(FLOAT)jointY+3),b,armThick+2); m_d2dTarget->DrawLine(D2D1::Point2F((FLOAT)jointX+2,(FLOAT)jointY+3),D2D1::Point2F((FLOAT)headX+2,(FLOAT)headY+3),b,armThin+2);
+    b->SetColor(d2dFromColorRef(RGB(238,236,230))); m_d2dTarget->DrawLine(D2D1::Point2F((FLOAT)pivotX,(FLOAT)pivotY),D2D1::Point2F((FLOAT)jointX,(FLOAT)jointY),b,armThick);
+    b->SetColor(d2dFromColorRef(RGB(228,226,218))); m_d2dTarget->DrawLine(D2D1::Point2F((FLOAT)jointX,(FLOAT)jointY),D2D1::Point2F((FLOAT)headX,(FLOAT)headY),b,armThin);
+
+    // Headshell block at the stylus end. This mirrors the old GDI polygon that
+    // was temporarily lost during the Direct2D migration.
+    {
+        float hx = (float)headX;
+        float hy = (float)headY;
+        float hw = (float)std::max(10, recordR / 7);
+        float hh = (float)std::max(7, recordR / 11);
+        float c1 = cosf(bendAngle), s1 = sinf(bendAngle);
+        auto pt = [&](float lx, float ly) -> D2D1_POINT_2F {
+            return D2D1::Point2F(hx + lx * c1 - ly * s1,
+                                 hy + lx * s1 + ly * c1);
+        };
+        D2D1_POINT_2F shell[4] = {
+            pt(-hw * 0.35f, -hh * 0.5f),
+            pt( hw * 0.65f, -hh * 0.5f),
+            pt( hw * 0.65f,  hh * 0.5f),
+            pt(-hw * 0.35f,  hh * 0.5f)
+        };
+        ID2D1PathGeometry* geom = nullptr;
+        if (m_d2dFactory && SUCCEEDED(m_d2dFactory->CreatePathGeometry(&geom)) && geom) {
+            ID2D1GeometrySink* sink = nullptr;
+            if (SUCCEEDED(geom->Open(&sink)) && sink) {
+                sink->BeginFigure(shell[0], D2D1_FIGURE_BEGIN_FILLED);
+                sink->AddLine(shell[1]);
+                sink->AddLine(shell[2]);
+                sink->AddLine(shell[3]);
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->Close();
+                releaseCom(sink);
+
+                b->SetColor(D2D1::ColorF(0, 0, 0, 0.22f));
+                D2D1_MATRIX_3X2_F oldTransform;
+                m_d2dTarget->GetTransform(&oldTransform);
+                m_d2dTarget->SetTransform(D2D1::Matrix3x2F::Translation(2.0f, 3.0f) * oldTransform);
+                m_d2dTarget->FillGeometry(geom, b);
+                m_d2dTarget->SetTransform(oldTransform);
+
+                b->SetColor(d2dFromColorRef(RGB(244,242,238)));
+                m_d2dTarget->FillGeometry(geom, b);
+                b->SetColor(d2dFromColorRef(RGB(30,28,24)));
+                m_d2dTarget->DrawGeometry(geom, b, 1.0f);
+            }
+            releaseCom(geom);
+        }
+
+        D2D1_POINT_2F styT = pt(hw * 0.55f, hh * 0.1f);
+        D2D1_POINT_2F styB = pt(hw * 0.85f, hh * 0.55f);
+        b->SetColor(d2dFromColorRef(RGB(40,38,34)));
+        m_d2dTarget->DrawLine(styT, styB, b, 2.0f);
+    }
+    float po=(float)std::max(10,recordR/9), pi=(float)std::max(5,(int)po/2); b->SetColor(d2dFromColorRef(RGB(60,56,52))); m_d2dTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F((FLOAT)pivotX,(FLOAT)pivotY),po,po),b); b->SetColor(d2dFromColorRef(RGB(238,236,230))); m_d2dTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F((FLOAT)pivotX,(FLOAT)pivotY),pi,pi),b);
+    releaseCom(b);
+}
+
+void DanmakuEngine::drawDanmakuD2D() {
+    if (!m_d2dTarget || !m_dwriteTextFormat || !m_config.enabled) return;
+    ID2D1SolidColorBrush* b = nullptr; if (FAILED(m_d2dTarget->CreateSolidColorBrush(D2D1::ColorF(1,1,1,1), &b))) return;
+    for (const auto& item : m_danmakuList) { if (!item.active) continue; b->SetColor(d2dFromColorRef(item.color,1.0f)); m_d2dTarget->DrawTextW(item.text.c_str(), (UINT32)item.text.length(), m_dwriteTextFormat, D2D1::RectF(item.x,item.y,item.x+item.width+96.0f,item.y+96.0f), b); }
+    releaseCom(b);
+}
+
+
+
+
+
+

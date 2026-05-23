@@ -1,8 +1,10 @@
-#ifndef DANMAKU_ENGINE_H
+﻿#ifndef DANMAKU_ENGINE_H
 #define DANMAKU_ENGINE_H
 
 #include "danmaku_engine_types.h"
 #include <windows.h>
+#include <d2d1.h>
+#include <dwrite.h>
 #include <mutex>
 
 class DanmakuEngine {
@@ -19,7 +21,7 @@ public:
     void addDanmaku(const std::wstring& text, COLORREF color = RGB(255, 255, 255));
     void clearDanmaku();
 
-    // ── Pool-based looping playback ───────────────────────────────
+    // 鈹€鈹€ Pool-based looping playback 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     // UI calls addToPool() for each fetched comment. The engine then drips
     // them onto active tracks at a controlled cadence and loops back to
     // index 0 when the pool is exhausted, until clearPool() is invoked.
@@ -68,6 +70,12 @@ private:
     HBITMAP m_coverBitmap; // optional album art rendered onto the vinyl label
     int     m_coverBitmapW;
     int     m_coverBitmapH;
+    ID2D1Factory*          m_d2dFactory;
+    IDWriteFactory*        m_dwriteFactory;
+    ID2D1DCRenderTarget*   m_d2dTarget;
+    IDWriteTextFormat*     m_dwriteTextFormat;
+    ID2D1Bitmap*           m_coverD2DBitmap;
+    bool                   m_coverD2DDirty;
     int m_width;
     int m_height;
     float m_recordAngle; // decorative vinyl rotation angle, radians
@@ -92,6 +100,14 @@ private:
     float measureTextWidth(const std::wstring& text) const;
     void drawSoftBackground(HDC dc);
     void drawTurntable(HDC dc);
+    bool createD2DTarget();
+    void discardD2DTarget();
+    void shutdownD2D();
+    void rebuildD2DCoverIfNeeded();
+    ID2D1Bitmap* createD2DBitmapFromHBITMAP(HBITMAP bitmap);
+    void drawSoftBackgroundD2D();
+    void drawTurntableD2D();
+    void drawDanmakuD2D();
     int allocateTrack();
     void recycleTrack(int track);
     void dripFromPool();      // try to spawn next pool item if any track has room
@@ -99,3 +115,5 @@ private:
 };
 
 #endif // DANMAKU_ENGINE_H
+
+

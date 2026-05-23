@@ -1,4 +1,4 @@
-#include "ui/danmaku_preferences.h"
+﻿#include "ui/danmaku_preferences.h"
 #include <foobar2000/SDK/foobar2000.h>
 #include <foobar2000/SDK/cfg_var.h>
 #include <windows.h>
@@ -20,6 +20,14 @@ static constexpr GUID guid_cfg_speed_percent =
 static constexpr GUID guid_cfg_turntable_speed_percent =
 { 0xc2c18b7e, 0xe550, 0x42ab, { 0x93, 0xc7, 0x7e, 0x5d, 0x04, 0xcb, 0x8e, 0x93 } };
 
+// {B43E7AE1-9F3B-4A21-928B-E7DAE977CC41}
+static constexpr GUID guid_cfg_bk_aspect_min =
+{ 0xb43e7ae1, 0x9f3b, 0x4a21, { 0x92, 0x8b, 0xe7, 0xda, 0xe9, 0x77, 0xcc, 0x41 } };
+
+// {F6D9643A-B1F6-4E92-B5A1-CB2278E2B17D}
+static constexpr GUID guid_cfg_bk_aspect_max =
+{ 0xf6d9643a, 0xb1f6, 0x4e92, { 0xb5, 0xa1, 0xcb, 0x22, 0x78, 0xe2, 0xb1, 0x7d } };
+
 // {1A0C9E11-74A4-49C7-904A-B2C2BB566F87}
 static constexpr GUID guid_pref_page =
 { 0x1a0c9e11, 0x74a4, 0x49c7, { 0x90, 0x4a, 0xb2, 0xc2, 0xbb, 0x56, 0x6f, 0x87 } };
@@ -36,11 +44,17 @@ static constexpr int kMaxSpeedPercent = 300;
 static constexpr int kDefaultTurntableSpeedPercent = 100;
 static constexpr int kMinTurntableSpeedPercent = 20;
 static constexpr int kMaxTurntableSpeedPercent = 300;
+static constexpr int kDefaultBkAspectMinTenths = 18;
+static constexpr int kDefaultBkAspectMaxTenths = 23;
+static constexpr int kMinBkAspectTenths = 10;
+static constexpr int kMaxBkAspectTenths = 35;
 
 static cfg_int g_cfg_spawn_interval(guid_cfg_spawn_interval, kDefaultSpawnIntervalMs);
 static cfg_int g_cfg_track_count(guid_cfg_track_count, kDefaultTrackCount);
 static cfg_int g_cfg_speed_percent(guid_cfg_speed_percent, kDefaultSpeedPercent);
 static cfg_int g_cfg_turntable_speed_percent(guid_cfg_turntable_speed_percent, kDefaultTurntableSpeedPercent);
+static cfg_int g_cfg_bk_aspect_min(guid_cfg_bk_aspect_min, kDefaultBkAspectMinTenths);
+static cfg_int g_cfg_bk_aspect_max(guid_cfg_bk_aspect_max, kDefaultBkAspectMaxTenths);
 
 static int clamp_interval(int v) {
     return std::max(kMinSpawnIntervalMs, std::min(kMaxSpawnIntervalMs, v));
@@ -53,6 +67,9 @@ static int clamp_speed(int v) {
 }
 static int clamp_turntable_speed(int v) {
     return std::max(kMinTurntableSpeedPercent, std::min(kMaxTurntableSpeedPercent, v));
+}
+static int clamp_bk_aspect(int v) {
+    return std::max(kMinBkAspectTenths, std::min(kMaxBkAspectTenths, v));
 }
 
 int danmaku_default_spawn_interval_ms() { return kDefaultSpawnIntervalMs; }
@@ -74,13 +91,29 @@ void danmaku_set_turntable_speed_percent(int value) { g_cfg_turntable_speed_perc
 float danmaku_get_turntable_speed() {
     return 0.42f * ((float)danmaku_get_turntable_speed_percent() / 100.0f);
 }
+int danmaku_default_bk_aspect_min_tenths() { return kDefaultBkAspectMinTenths; }
+int danmaku_default_bk_aspect_max_tenths() { return kDefaultBkAspectMaxTenths; }
+int danmaku_get_bk_aspect_min_tenths() {
+    int mn = clamp_bk_aspect((int)g_cfg_bk_aspect_min.get());
+    int mx = clamp_bk_aspect((int)g_cfg_bk_aspect_max.get());
+    return std::min(mn, mx);
+}
+int danmaku_get_bk_aspect_max_tenths() {
+    int mn = clamp_bk_aspect((int)g_cfg_bk_aspect_min.get());
+    int mx = clamp_bk_aspect((int)g_cfg_bk_aspect_max.get());
+    return std::max(mn, mx);
+}
+void danmaku_set_bk_aspect_min_tenths(int value) { g_cfg_bk_aspect_min = clamp_bk_aspect(value); }
+void danmaku_set_bk_aspect_max_tenths(int value) { g_cfg_bk_aspect_max = clamp_bk_aspect(value); }
+float danmaku_get_bk_aspect_min() { return (float)danmaku_get_bk_aspect_min_tenths() / 10.0f; }
+float danmaku_get_bk_aspect_max() { return (float)danmaku_get_bk_aspect_max_tenths() / 10.0f; }
 
 class DanmakuPreferencesInstance : public preferences_page_instance {
 public:
     DanmakuPreferencesInstance(HWND parent, preferences_page_callback::ptr cb)
         : m_parent(parent), m_callback(cb), m_wnd(nullptr),
           m_intervalEdit(nullptr), m_tracksEdit(nullptr), m_speedEdit(nullptr),
-          m_turntableSpeedEdit(nullptr) {
+          m_turntableSpeedEdit(nullptr), m_bkAspectMinEdit(nullptr), m_bkAspectMaxEdit(nullptr) {
         createWindow();
     }
 
@@ -101,10 +134,14 @@ public:
         danmaku_set_track_count(readInt(m_tracksEdit, kDefaultTrackCount, clamp_tracks));
         danmaku_set_speed_percent(readInt(m_speedEdit, kDefaultSpeedPercent, clamp_speed));
         danmaku_set_turntable_speed_percent(readInt(m_turntableSpeedEdit, kDefaultTurntableSpeedPercent, clamp_turntable_speed));
+        danmaku_set_bk_aspect_min_tenths(readInt(m_bkAspectMinEdit, kDefaultBkAspectMinTenths, clamp_bk_aspect));
+        danmaku_set_bk_aspect_max_tenths(readInt(m_bkAspectMaxEdit, kDefaultBkAspectMaxTenths, clamp_bk_aspect));
         writeEdit(danmaku_get_spawn_interval_ms());
         writeTracks(danmaku_get_track_count());
         writeSpeed(danmaku_get_speed_percent());
         writeTurntableSpeed(danmaku_get_turntable_speed_percent());
+        writeBkAspectMin(danmaku_get_bk_aspect_min_tenths());
+        writeBkAspectMax(danmaku_get_bk_aspect_max_tenths());
         if (m_callback.is_valid()) m_callback->on_state_changed();
     }
 
@@ -113,11 +150,13 @@ public:
         writeTracks(kDefaultTrackCount);
         writeSpeed(kDefaultSpeedPercent);
         writeTurntableSpeed(kDefaultTurntableSpeedPercent);
+        writeBkAspectMin(kDefaultBkAspectMinTenths);
+        writeBkAspectMax(kDefaultBkAspectMaxTenths);
         if (m_callback.is_valid()) m_callback->on_state_changed();
     }
 
 private:
-    enum { IDC_INTERVAL = 1001, IDC_TRACKS = 1002, IDC_SPEED = 1003, IDC_TURNTABLE_SPEED = 1004 };
+    enum { IDC_INTERVAL = 1001, IDC_TRACKS = 1002, IDC_SPEED = 1003, IDC_TURNTABLE_SPEED = 1004, IDC_BK_ASPECT_MIN = 1005, IDC_BK_ASPECT_MAX = 1006 };
 
     HWND m_parent;
     preferences_page_callback::ptr m_callback;
@@ -126,6 +165,8 @@ private:
     HWND m_tracksEdit;
     HWND m_speedEdit;
     HWND m_turntableSpeedEdit;
+    HWND m_bkAspectMinEdit;
+    HWND m_bkAspectMaxEdit;
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* self = reinterpret_cast<DanmakuPreferencesInstance*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
@@ -136,7 +177,7 @@ private:
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
         if (self && msg == WM_COMMAND &&
-            (LOWORD(wp) == IDC_INTERVAL || LOWORD(wp) == IDC_TRACKS || LOWORD(wp) == IDC_SPEED || LOWORD(wp) == IDC_TURNTABLE_SPEED) &&
+            (LOWORD(wp) == IDC_INTERVAL || LOWORD(wp) == IDC_TRACKS || LOWORD(wp) == IDC_SPEED || LOWORD(wp) == IDC_TURNTABLE_SPEED || LOWORD(wp) == IDC_BK_ASPECT_MIN || LOWORD(wp) == IDC_BK_ASPECT_MAX) &&
             HIWORD(wp) == EN_CHANGE) {
             if (self->m_callback.is_valid()) self->m_callback->on_state_changed();
             return 0;
@@ -170,7 +211,7 @@ private:
             12, 40, 90, 24, m_wnd, (HMENU)(INT_PTR)IDC_INTERVAL, inst, nullptr);
 
         CreateWindowExW(0, L"STATIC",
-            L"Larger = sparser. Default: 5000 ms. Suggested range: 1000–8000 ms.",
+            L"Larger = sparser. Default: 5000 ms. Suggested range: 1000鈥?000 ms.",
             WS_CHILD | WS_VISIBLE,
             112, 43, 480, 20, m_wnd, nullptr, inst, nullptr);
 
@@ -184,7 +225,7 @@ private:
             12, 104, 90, 24, m_wnd, (HMENU)(INT_PTR)IDC_TRACKS, inst, nullptr);
 
         CreateWindowExW(0, L"STATIC",
-            L"Fewer lanes = wider line spacing. Default: 4. Suggested range: 3–6.",
+            L"Fewer lanes = wider line spacing. Default: 4. Suggested range: 3鈥?.",
             WS_CHILD | WS_VISIBLE,
             112, 107, 520, 20, m_wnd, nullptr, inst, nullptr);
 
@@ -217,18 +258,24 @@ private:
             112, 235, 560, 20, m_wnd, nullptr, inst, nullptr);
 
         CreateWindowExW(0, L"STATIC",
-            L"Settings take effect immediately after Apply.",
+            L"BK spread aspect ratio range (x10): min / max. Default: 18 - 23 = 1.8 - 2.3.",
             WS_CHILD | WS_VISIBLE,
-            12, 270, 560, 20, m_wnd, nullptr, inst, nullptr);
+            12, 270, 650, 20, m_wnd, nullptr, inst, nullptr);
 
         SendMessageW(m_intervalEdit, EM_SETLIMITTEXT, 5, 0);
         SendMessageW(m_tracksEdit, EM_SETLIMITTEXT, 2, 0);
         SendMessageW(m_speedEdit, EM_SETLIMITTEXT, 3, 0);
         SendMessageW(m_turntableSpeedEdit, EM_SETLIMITTEXT, 3, 0);
+        m_bkAspectMinEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, 12, 296, 60, 24, m_wnd, (HMENU)(INT_PTR)IDC_BK_ASPECT_MIN, inst, nullptr);
+        m_bkAspectMaxEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, 82, 296, 60, 24, m_wnd, (HMENU)(INT_PTR)IDC_BK_ASPECT_MAX, inst, nullptr);
+        SendMessageW(m_bkAspectMinEdit, EM_SETLIMITTEXT, 2, 0);
+        SendMessageW(m_bkAspectMaxEdit, EM_SETLIMITTEXT, 2, 0);
         writeEdit(danmaku_get_spawn_interval_ms());
         writeTracks(danmaku_get_track_count());
         writeSpeed(danmaku_get_speed_percent());
         writeTurntableSpeed(danmaku_get_turntable_speed_percent());
+        writeBkAspectMin(danmaku_get_bk_aspect_min_tenths());
+        writeBkAspectMax(danmaku_get_bk_aspect_max_tenths());
     }
 
     int readInt(HWND edit, int defaultValue, int (*clampFn)(int)) const {
@@ -259,12 +306,24 @@ private:
         swprintf_s(buf, L"%d", clamp_turntable_speed(v));
         SetWindowTextW(m_turntableSpeedEdit, buf);
     }
+    void writeBkAspectMin(int v) {
+        wchar_t buf[32];
+        swprintf_s(buf, L"%d", clamp_bk_aspect(v));
+        SetWindowTextW(m_bkAspectMinEdit, buf);
+    }
+    void writeBkAspectMax(int v) {
+        wchar_t buf[32];
+        swprintf_s(buf, L"%d", clamp_bk_aspect(v));
+        SetWindowTextW(m_bkAspectMaxEdit, buf);
+    }
 
     bool hasChanged() const {
         return readInt(m_intervalEdit, kDefaultSpawnIntervalMs, clamp_interval) != danmaku_get_spawn_interval_ms() ||
                readInt(m_tracksEdit, kDefaultTrackCount, clamp_tracks) != danmaku_get_track_count() ||
                readInt(m_speedEdit, kDefaultSpeedPercent, clamp_speed) != danmaku_get_speed_percent() ||
-               readInt(m_turntableSpeedEdit, kDefaultTurntableSpeedPercent, clamp_turntable_speed) != danmaku_get_turntable_speed_percent();
+               readInt(m_turntableSpeedEdit, kDefaultTurntableSpeedPercent, clamp_turntable_speed) != danmaku_get_turntable_speed_percent() ||
+               readInt(m_bkAspectMinEdit, kDefaultBkAspectMinTenths, clamp_bk_aspect) != danmaku_get_bk_aspect_min_tenths() ||
+               readInt(m_bkAspectMaxEdit, kDefaultBkAspectMaxTenths, clamp_bk_aspect) != danmaku_get_bk_aspect_max_tenths();
     }
 };
 
@@ -279,3 +338,5 @@ public:
 };
 
 static preferences_page_factory_t<DanmakuPreferencesPage> g_danmaku_preferences_page_factory;
+
+

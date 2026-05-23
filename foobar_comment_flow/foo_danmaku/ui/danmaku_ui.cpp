@@ -102,7 +102,7 @@ static HBITMAP decodeCoverBytes(const void* data, size_t size) {
             // fully in-memory.
             if (srcW > 0 && srcH > 0) {
                 float aspect = (float)srcW / (float)srcH;
-                if (aspect >= 1.85f && aspect <= 2.15f) {
+                if (aspect >= danmaku_get_bk_aspect_min() && aspect <= danmaku_get_bk_aspect_max()) {
                     UINT cropX = srcW / 2;
                     UINT cropW = srcW - cropX;
                     croppedRightHalf.reset(new Gdiplus::Bitmap(cropW, srcH, PixelFormat32bppARGB));
@@ -751,3 +751,4 @@ LRESULT CALLBACK DanmakuUIWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam,
     }
     return 0;
 }
+
