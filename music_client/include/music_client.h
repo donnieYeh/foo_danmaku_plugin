@@ -128,8 +128,12 @@ int music_client_search_song(
 /* ── comments ────────────────────────────────────────── */
 
 /** Fetch one page of comments (one HTTP round-trip).
- *  See MusicProviderVTable::get_comments_paged for semantics.
- *  @return MUSIC_OK on success (even if out_delivered == 0). */
+ *
+ *  End-of-stream: MUSIC_OK with *out_delivered == 0.
+ *  A short page (*out_delivered < page_limit) is NOT end-of-stream;
+ *  callers must keep paging until they receive 0 delivered.
+ *
+ *  @return MUSIC_OK on success (even if *out_delivered == 0). */
 int music_client_get_comments_paged(
     MusicClientHandle            h,
     const wchar_t*               song_id,
