@@ -99,6 +99,41 @@ NETEASE_API int __stdcall netease_get_comments_by_id(
     return rc;
 }
 
+/* ── get_comments_by_id_paged (single-page streaming) ── */
+
+NETEASE_API int __stdcall netease_get_comments_by_id_paged(
+    NeteaseHandle          h,
+    const wchar_t*         song_id,
+    int                    offset,
+    int                    page_limit,
+    NeteaseCommentCallback callback,
+    void*                  userdata,
+    int*                   out_delivered)
+{
+    if (out_delivered) *out_delivered = 0;
+    if (!h || !song_id || !callback || page_limit <= 0 || offset < 0)
+        return NETEASE_ERR_PARAM;
+
+    NeteaseContext* c = ctx(h);
+    std::wstring err;
+    int delivered = 0;
+
+    int rc = c->api.get_comments_page(
+        song_id, offset, page_limit,
+        [&](const netease::Comment& cm) -> bool {
+            int ret = callback(cm.content.c_str(),
+                               cm.nickname.c_str(),
+                               cm.like_count,
+                               userdata);
+            return ret == 0; /* false = stop */
+        },
+        delivered, err);
+
+    if (rc != NETEASE_OK) set_error(c, err);
+    if (out_delivered) *out_delivered = delivered;
+    return rc;
+}
+
 /* ── get_comments_by_keyword ─────────────────────────── */
 
 NETEASE_API int __stdcall netease_get_comments_by_keyword(

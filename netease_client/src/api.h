@@ -36,6 +36,21 @@ public:
                      CommentVisitor      visitor,
                      std::wstring&       error_msg);
 
+    /**
+     * Fetch exactly one page of comments (one HTTP request).
+     * @param offset Page start, in units of 1.
+     * @param limit  Page size (capped at 100 server-side).
+     * @param out_delivered  Set to the actual number of comments handed to visitor.
+     * On the first page (offset==0) hotComments are emitted before the regular list.
+     * Returns NETEASE_OK on success (even if 0 items returned = end of stream).
+     */
+    int get_comments_page(const std::wstring& song_id,
+                          int                 offset,
+                          int                 limit,
+                          CommentVisitor      visitor,
+                          int&                out_delivered,
+                          std::wstring&       error_msg);
+
 private:
     HttpClient& m_http;
 

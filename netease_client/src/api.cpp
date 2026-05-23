@@ -44,12 +44,22 @@ static std::string api_call(
     std::wstring&      error_msg)
 {
     if (resp.empty()) return "";
-    /* The top-level "code" field is always near the END of NetEase responses
-     * (after the large "result"/"data"/"hotComments" blocks).
-     * Search the last 512 bytes to avoid matching nested privilege.code. */
-    size_t tail_start = resp.size() > 512 ? resp.size() - 512 : 0;
-    std::string tail  = resp.substr(tail_start);
-    long long code    = json::num(tail, "code", 200);
+    /* The top-level "code" field is at the end of many NetEase responses, but
+     * search results contain lots of nested "code":0 fields in privileges.
+     * json::num() returns the FIRST match, so using it on a tail substring can
+     * falsely treat a successful cloudsearch response as "API error 0".
+     * Read the LAST "code" occurrence instead; for these endpoints that is the
+     * top-level status code we care about. */
+    std::string codePat = "\"code\":";
+    size_t codePos = resp.rfind(codePat);
+    long long code = 200;
+    std::string tail;
+    if (codePos != std::string::npos) {
+        tail = resp.substr(codePos);
+        code = json::num(tail, "code", 200);
+    } else {
+        tail = resp.size() > 512 ? resp.substr(resp.size() - 512) : resp;
+    }
     if (code != 200) {
         std::string msg = json::str(tail, "message");
         if (msg.empty()) msg = json::str(tail, "msg");
@@ -193,6 +203,57 @@ int ApiClient::get_comments(
         }
     }
 
+    return NETEASE_OK;
+}
+
+/* ── get_comments_page (single HTTP request) ──────────── */
+
+int ApiClient::get_comments_page(
+    const std::wstring& song_id,
+    int                 offset,
+    int                 limit,
+    CommentVisitor      visitor,
+    int&                out_delivered,
+    std::wstring&       error_msg)
+{
+    out_delivered = 0;
+    int page_size = std::min(std::max(limit, 1), 100);
+
+    std::wstring path = L"/api/v1/resource/comments/R_SO_4_"
+                      + song_id
+                      + L"?limit=" + std::to_wstring(page_size)
+                      + L"&offset=" + std::to_wstring(offset)
+                      + L"&total=true";
+
+    loga("get_comments_page offset=" + std::to_string(offset)
+       + " limit=" + std::to_string(page_size));
+
+    std::string raw;
+    if (!m_http.get(path, raw, error_msg)) {
+        log(L"get_comments_page HTTP failed: " + error_msg);
+        return NETEASE_ERR_NETWORK;
+    }
+
+    std::string resp = api_call(raw, error_msg);
+    if (resp.empty()) return NETEASE_ERR_API;
+
+    int fetched = 0;
+    // hotComments only attached to first page in NetEase API
+    if (offset == 0) {
+        std::string hot_raw = json::array_raw(resp, "hotComments");
+        if (!hot_raw.empty()) {
+            loga("hotComments:");
+            parse_comment_list(hot_raw, page_size, fetched, visitor);
+            // fetched now counts hotComments emitted; visitor may have stopped early
+        }
+    }
+
+    std::string comments_raw = json::array_raw(resp, "comments");
+    if (!comments_raw.empty()) {
+        parse_comment_list(comments_raw, page_size * 2, fetched, visitor);
+    }
+
+    out_delivered = fetched;
     return NETEASE_OK;
 }
 

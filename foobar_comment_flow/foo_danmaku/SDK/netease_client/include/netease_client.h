@@ -82,6 +82,29 @@ NETEASE_API int __stdcall netease_get_comments_by_id(
 );
 
 /**
+ * Fetch exactly one page of comments (single HTTP request).
+ * Use this for streaming/pagination from a caller-managed offset.
+ *
+ * @param offset          0-based starting offset, in comments.
+ * @param page_limit      Page size, 1..100 (will be clamped).
+ * @param out_delivered   Number of comments actually delivered to the callback
+ *                        for this page (may be 0 = end of stream).
+ *
+ * Returns NETEASE_OK on success (even if 0 comments). Returns NETEASE_ERR_* on
+ * failure. On the first page (offset==0) hotComments are emitted before the
+ * regular list.
+ */
+NETEASE_API int __stdcall netease_get_comments_by_id_paged(
+    NeteaseHandle          h,
+    const wchar_t*         song_id,
+    int                    offset,
+    int                    page_limit,
+    NeteaseCommentCallback callback,
+    void*                  userdata,
+    int*                   out_delivered
+);
+
+/**
  * Search a song, write its ID into out_song_id.
  * @param out_song_id  Caller-allocated buffer (recommend 32 wchars).
  * @param buf_wchars   Buffer size in wchar_t units.

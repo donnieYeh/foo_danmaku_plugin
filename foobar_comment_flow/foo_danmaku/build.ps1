@@ -47,6 +47,7 @@ if (-not (Test-Path "$NETEASE_SDK\netease_client.lib")) {
 $projectSrc = @(
     "$PROJECT\foo_danmaku.cpp",
     "$PROJECT\ui\danmaku_ui.cpp",
+    "$PROJECT\ui\danmaku_preferences.cpp",
     "$PROJECT\core\danmaku_engine.cpp",
     "$PROJECT\core\playback_monitor.cpp"
     # netEase/api.cpp and signature.cpp replaced by netease_client.dll

@@ -1,13 +1,17 @@
 ﻿// danmaku_ui.cpp - UI element implementation for foobar2000 danmaku plugin
 #include "ui/danmaku_ui.h"
+#include "ui/danmaku_preferences.h"
 #include "../core/danmaku_engine.h"
 #include "../core/playback_monitor.h"
 #include "netease_client.h"   // standalone NetEase comment library
 #include <windows.h>
 #include <windowsx.h>
+#include <mmsystem.h>
 #include <string>
 #include <thread>
 #include <atomic>
+
+#pragma comment(lib, "winmm.lib")
 
 // ── logging helpers ──────────────────────────────────────
 // Writes to foobar2000's View→Console AND OutputDebugString.
@@ -15,6 +19,11 @@ static void danmaku_log(const char* msg) {
     console::print(msg);
     OutputDebugStringA(msg);
     OutputDebugStringA("\n");
+}
+// Exported for engine TU (declared extern there) so its diagnostic logs
+// also land in foobar2000's View → Console, not only DebugView.
+extern "C" void danmaku_log_external(const char* msg) {
+    danmaku_log(msg);
 }
 static void danmaku_logW(const wchar_t* wmsg) {
     // Convert to UTF-8 for fb2k console
@@ -38,7 +47,14 @@ static PlaybackMonitor* g_monitor = nullptr;
 static NeteaseHandle    g_netease = nullptr;
 static std::atomic<bool> g_fetching{false};
 
-/* Per-comment callback: adds each comment to the engine */
+// Each new track bumps the generation; in-flight worker threads from prior
+// tracks detect the mismatch and exit immediately. Atomic so the worker
+// thread can read it without locking.
+static std::atomic<uint64_t> g_trackGen{0};
+
+/* Per-comment callback: pushes each comment into the engine's pool.
+   The engine then drips them onto the screen at its own pace and loops back
+   to the first comment when the pool is exhausted. */
 static std::atomic<int> g_comment_count{0};
 static int __stdcall comment_cb(
     const wchar_t* content, const wchar_t* nickname,
@@ -49,9 +65,10 @@ static int __stdcall comment_cb(
     if      (like_count > 1000) color = RGB(255,100,100);
     else if (like_count > 100)  color = RGB(255,200,100);
     else if (like_count > 10)   color = RGB(100,200,255);
-    eng->addDanmaku(content, color);
+    if (content && *content) {
+        eng->addToPool(content, color);
+    }
     int n = ++g_comment_count;
-    // Log first comment as sample
     if (n == 1) {
         std::wstring sample = L"[Danmaku] first comment: ";
         sample += content ? content : L"(null)";
@@ -64,6 +81,7 @@ static int __stdcall comment_cb(
 }
 
 static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void* userdata);
+static void onPlayStateCallback(bool playing, void* userdata);
 
 DanmakuUI::DanmakuUI() {}
 
@@ -102,6 +120,7 @@ DanmakuUIInstance::DanmakuUIInstance(HWND parent, ui_element_instance_callback_p
         g_monitor->init();
     }
     g_monitor->setOnNewTrack(onNewTrackCallback, m_wnd);
+    g_monitor->setOnPlayState(onPlayStateCallback, m_wnd);
 
     if (!g_netease) {
         g_netease = netease_create(nullptr); // anonymous access
@@ -111,12 +130,21 @@ DanmakuUIInstance::DanmakuUIInstance(HWND parent, ui_element_instance_callback_p
         }, nullptr);
         danmaku_log("[Danmaku] netease_client handle created, log callback registered");
     }
+
+    if (g_engine) {
+        DanmakuConfig cfg = g_engine->getConfig();
+        cfg.spawnIntervalMs = danmaku_get_spawn_interval_ms();
+        cfg.maxTracks = danmaku_get_track_count();
+        cfg.baseSpeed = danmaku_get_base_speed();
+        g_engine->setConfig(cfg);
+    }
 }
 
 DanmakuUIInstance::~DanmakuUIInstance() {
     // 先清回调，防止异步线程在销毁后访问已销毁的窗口
     if (g_monitor) {
         g_monitor->setOnNewTrack(nullptr, nullptr);
+        g_monitor->setOnPlayState(nullptr, nullptr);
     }
 
     // 等待正在进行的异步请求完成（最多等 200ms）
@@ -137,8 +165,6 @@ DanmakuUIInstance::~DanmakuUIInstance() {
 }
 
 static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void* userdata) {
-    if (g_fetching.exchange(true)) return;
-
     DanmakuUIWindow* wnd = reinterpret_cast<DanmakuUIWindow*>(userdata);
     if (!wnd || !g_netease || !g_engine) {
         danmaku_log("[Danmaku] onNewTrack: guard failed (wnd/netease/engine null)");
@@ -163,36 +189,131 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
 
     HWND targetHwnd = wnd->getHwnd();
 
-    std::thread([targetHwnd, titleStr, artistStr]() {
-        danmaku_log("[Danmaku] Fetching comments (background thread started)");
-        g_comment_count = 0;
-        g_engine->clearDanmaku();
+    // Bump generation BEFORE clearing pool, so any still-running worker thread
+    // from a previous track sees the mismatch and exits without polluting the
+    // new pool. Streaming worker captures this gen and re-checks on every page.
+    uint64_t gen = ++g_trackGen;
+    if (g_fetching.exchange(true)) {
+        danmaku_log("[Danmaku] New track arrived while previous fetch is active; cancelling stale worker");
+    }
+    g_engine->clearPool();
+    g_comment_count = 0;
 
-        int rc = netease_get_comments_by_keyword(
-            g_netease,
-            titleStr.c_str(),
-            artistStr.empty() ? nullptr : artistStr.c_str(),
-            50,
-            comment_cb,
-            g_engine);
+    std::thread([targetHwnd, titleStr, artistStr, gen]() {
+        const int  kInitialBurst   = 100;   // first batch — enough to start playing
+        const int  kPageSize       = 50;    // incremental page size
+        const int  kLowWaterMark   = 30;    // when poolRemaining ≤ this, prefetch
+        const int  kMaxPages       = 100;   // hard cap = up to ~5000 comments
+        const int  kSleepTickMs    = 200;
 
+        auto cancelled = [gen]() {
+            return g_trackGen.load() != gen;
+        };
+
+        danmaku_log("[Danmaku] streaming worker: resolving song id\u2026");
+
+        // ── Step 1: resolve song id from "title artist" keyword ──────────
+        std::wstring kw = titleStr;
+        if (!artistStr.empty()) kw += L" " + artistStr;
+        wchar_t song_id[64] = {0};
+        int rc = netease_search_song(g_netease, kw.c_str(), song_id, 64);
         if (rc != NETEASE_OK) {
-            std::wstring err = L"[Danmaku] Comment fetch FAILED rc="
+            std::wstring err = L"[Danmaku] search_song FAILED rc="
                              + std::to_wstring(rc)
                              + L" err=" + netease_last_error(g_netease);
             danmaku_logW(err.c_str());
-        } else {
-            std::wstring ok = L"[Danmaku] Comments loaded: "
-                            + std::to_wstring(g_comment_count.load())
-                            + L" items";
-            danmaku_logW(ok.c_str());
+            if (!cancelled()) g_fetching = false;
+            return;
+        }
+        if (cancelled()) { return; }
+
+        // ── Step 2: fetch initial burst (one page of 100) so playback can start ──
+        int delivered = 0;
+        rc = netease_get_comments_by_id_paged(
+            g_netease, song_id, 0, kInitialBurst,
+            comment_cb, g_engine, &delivered);
+        if (rc != NETEASE_OK) {
+            std::wstring err = L"[Danmaku] initial page FAILED rc="
+                             + std::to_wstring(rc)
+                             + L" err=" + netease_last_error(g_netease);
+            danmaku_logW(err.c_str());
+            if (!cancelled()) g_fetching = false;
+            return;
         }
 
-        if (IsWindow(targetHwnd))
-            InvalidateRect(targetHwnd, nullptr, FALSE);
+        {
+            std::wstring msg = L"[Danmaku] initial burst: "
+                             + std::to_wstring(delivered)
+                             + L" comments — playback can start";
+            danmaku_logW(msg.c_str());
+        }
 
-        g_fetching = false;
+        if (IsWindow(targetHwnd)) InvalidateRect(targetHwnd, nullptr, FALSE);
+
+        // Server returned fewer than asked — already at end of stream.
+        bool serverExhausted = (delivered < kInitialBurst);
+        int  nextOffset      = delivered;
+        int  pagesFetched    = 1;
+
+        // ── Step 3: trickle more pages as the drip index approaches the end ──
+        while (!serverExhausted && !cancelled() && pagesFetched < kMaxPages) {
+            // Wait until the engine's pool is running low.
+            while (!cancelled()) {
+                int remaining = g_engine->poolRemaining();
+                int total     = g_engine->poolSize();
+                // remaining counts unread items in CURRENT cycle; once it wraps
+                // (remaining == total) we've started replaying — also a signal
+                // to prefetch ASAP.
+                if (remaining <= kLowWaterMark || remaining == total) break;
+                Sleep(kSleepTickMs);
+            }
+            if (cancelled()) break;
+
+            delivered = 0;
+            rc = netease_get_comments_by_id_paged(
+                g_netease, song_id, nextOffset, kPageSize,
+                comment_cb, g_engine, &delivered);
+            if (rc != NETEASE_OK) {
+                std::wstring err = L"[Danmaku] page@"
+                                 + std::to_wstring(nextOffset)
+                                 + L" FAILED rc=" + std::to_wstring(rc)
+                                 + L" err=" + netease_last_error(g_netease);
+                danmaku_logW(err.c_str());
+                // Don't kill the loop on transient errors — back off and retry once.
+                Sleep(2000);
+                if (cancelled()) break;
+                continue;
+            }
+
+            pagesFetched++;
+            nextOffset += delivered;
+
+            {
+                std::wstring msg = L"[Danmaku] page#"
+                                 + std::to_wstring(pagesFetched)
+                                 + L" offset=" + std::to_wstring(nextOffset - delivered)
+                                 + L" got=" + std::to_wstring(delivered)
+                                 + L" poolSize=" + std::to_wstring(g_engine->poolSize());
+                danmaku_logW(msg.c_str());
+            }
+
+            // Short page → server has no more comments. Pool will loop from here.
+            if (delivered < kPageSize) {
+                serverExhausted = true;
+                danmaku_log("[Danmaku] streaming complete — pool will loop from now on");
+            }
+        }
+
+        if (!cancelled()) g_fetching = false;
     }).detach();
+}
+
+static void onPlayStateCallback(bool playing, void* userdata) {
+    (void)userdata;
+    if (!g_engine) return;
+    g_engine->setPaused(!playing);
+    danmaku_log(playing ? "[Danmaku] playback resumed -> danmaku resumed"
+                        : "[Danmaku] playback paused/stopped -> danmaku paused");
 }
 
 DanmakuUIWindow::DanmakuUIWindow(HWND parent)
@@ -276,20 +397,34 @@ void DanmakuUIWindow::onHide() {
 }
 
 void DanmakuUIWindow::onSize(int w, int h) {
+    {
+        char msg[128];
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+                    "[Danmaku] WM_SIZE w=%d h=%d engine=%p", w, h, (void*)m_engine);
+        danmaku_log(msg);
+    }
     if (m_engine && w > 0 && h > 0) {
         m_engine->resize(w, h);
+    }
+    if (m_hwnd) {
+        InvalidateRect(m_hwnd, nullptr, FALSE);
     }
 }
 
 void DanmakuUIWindow::startTimer() {
     if (m_hwnd) {
-        SetTimer(m_hwnd, 1, 16, nullptr);
+        // WM_TIMER is otherwise often quantized to ~15.6ms or worse. Request
+        // 1ms system timer precision and tick at ~120Hz; movement itself is
+        // time-based, so this mainly improves visual sampling smoothness.
+        timeBeginPeriod(1);
+        SetTimer(m_hwnd, 1, 8, nullptr);
     }
 }
 
 void DanmakuUIWindow::stopTimer() {
     if (m_hwnd) {
         KillTimer(m_hwnd, 1);
+        timeEndPeriod(1);
     }
 }
 
@@ -299,15 +434,19 @@ void DanmakuUIWindow::onPaint() {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(m_hwnd, &ps);
 
-    RECT rect;
-    GetClientRect(m_hwnd, &rect);
-
-    HBRUSH hbr = CreateSolidBrush(RGB(0, 0, 0));
-    FillRect(hdc, &rect, hbr);
-    DeleteObject(hbr);
-
+    // No on-HDC FillRect: the engine's memDC is already cleared to black each
+    // frame and BitBlt is the single, atomic on-screen update. Drawing black
+    // on hdc first and then BitBlt'ing over it is the classic source of GDI
+    // flicker on large panels.
     if (m_engine) {
         m_engine->onPaint(hdc);
+    } else {
+        // Engine not yet attached — paint the invalidated region black so we
+        // don't show garbage.
+        RECT rect;
+        GetClientRect(m_hwnd, &rect);
+        HBRUSH hbr = (HBRUSH)GetStockObject(BLACK_BRUSH);
+        FillRect(hdc, &rect, hbr);
     }
 
     EndPaint(m_hwnd, &ps);
@@ -317,9 +456,23 @@ void DanmakuUIWindow::onTimer() {
     if (!m_hwnd) return;
 
     if (m_engine) {
+        DanmakuConfig cfg = m_engine->getConfig();
+        int prefInterval = danmaku_get_spawn_interval_ms();
+        int prefTracks = danmaku_get_track_count();
+        float prefSpeed = danmaku_get_base_speed();
+        if (cfg.spawnIntervalMs != prefInterval ||
+            cfg.maxTracks != prefTracks ||
+            cfg.baseSpeed != prefSpeed) {
+            cfg.spawnIntervalMs = prefInterval;
+            cfg.maxTracks = prefTracks;
+            cfg.baseSpeed = prefSpeed;
+            m_engine->setConfig(cfg);
+        }
         m_engine->onTimer();
     }
-    InvalidateRect(m_hwnd, nullptr, FALSE);
+    // Paint immediately instead of merely posting WM_PAINT; this reduces jitter
+    // when foobar's UI message queue is busy.
+    RedrawWindow(m_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
 }
 
 LRESULT CALLBACK DanmakuUIWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -329,7 +482,14 @@ LRESULT CALLBACK DanmakuUIWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam,
     case WM_NCCREATE: {
         CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
         if (cs && cs->lpCreateParams) {
-            SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+            auto* self = reinterpret_cast<DanmakuUIWindow*>(cs->lpCreateParams);
+            SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+            // CRITICAL: assign m_hwnd here, BEFORE WM_CREATE fires, so that
+            // onCreate()->startTimer()->SetTimer(m_hwnd,...) actually receives
+            // a valid HWND. Otherwise the ctor only assigns m_hwnd AFTER
+            // CreateWindowExW returns, by which point WM_CREATE has already
+            // run with m_hwnd==nullptr and the 60Hz timer is never armed.
+            self->m_hwnd = hwnd;
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
