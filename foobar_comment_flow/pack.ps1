@@ -1,14 +1,14 @@
 param(
     [ValidateSet("x64","Win32")]
     [string]$Platform = "x64",
-    [string]$Version  = "1.0.0"
+    [string]$Version  = "2.0.2"
 )
 
 $ErrorActionPreference = "Stop"
 
 $PROJECT    = $PSScriptRoot
 $FOO_DANMAKU_DLL = "$PROJECT\foo_danmaku\build\$Platform\foo_danmaku.dll"
-$NETEASE_DLL     = "$PROJECT\foo_danmaku\SDK\netease_client\netease_client.dll"
+$NETEASE_DLL     = "$PROJECT\..\netease_client\build\$Platform\netease_client.dll"
 $DIST            = "$PROJECT\dist"
 $COMPONENT_NAME  = "foo_danmaku"
 $OUTFILE         = "$DIST\${COMPONENT_NAME}-${Version}.fb2k-component"
