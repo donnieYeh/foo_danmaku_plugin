@@ -441,8 +441,9 @@ float DanmakuEngine::measureTextWidth(const std::wstring& text) const {
 void DanmakuEngine::drawSoftBackground(HDC dc) {
     if (!dc || m_width <= 0 || m_height <= 0) return;
 
-    // Reference screenshot tone, but with a clear vertical light-to-dark
-    // gradient: brighter charcoal on top, darker charcoal at the bottom.
+    // Base tone: clear vertical light-to-dark gradient. When cover art exists,
+    // it is painted above this as a dim, desaturated, intentionally blurred
+    // atmosphere layer so the vinyl/tonearm remain visually dominant.
     const COLORREF top = RGB(62, 64, 64);
     const COLORREF mid = RGB(45, 47, 47);
     const COLORREF bottom = RGB(28, 30, 30);
@@ -458,7 +459,60 @@ void DanmakuEngine::drawSoftBackground(HDC dc) {
         DeleteObject(br);
     }
 
-    // No radial glow here; keep the background as a clean vertical gradient.
+    if (m_coverBitmap && m_coverBitmapW > 0 && m_coverBitmapH > 0) {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+
+        // Cheap but effective blur: draw the cover into a much smaller bitmap,
+        // then stretch it back up with high-quality interpolation.
+        int smallW = std::max(32, m_width / 12);
+        int smallH = std::max(32, m_height / 12);
+        Gdiplus::Bitmap blurred(smallW, smallH, PixelFormat32bppARGB);
+        Gdiplus::Graphics bg(&blurred);
+        bg.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+        bg.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        bg.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        bg.Clear(Gdiplus::Color(255, 36, 38, 40));
+
+        Gdiplus::Bitmap cover(m_coverBitmap, nullptr);
+        float scale = std::max((float)smallW / (float)m_coverBitmapW,
+                               (float)smallH / (float)m_coverBitmapH);
+        int drawW = std::max(1, (int)((float)m_coverBitmapW * scale + 0.5f));
+        int drawH = std::max(1, (int)((float)m_coverBitmapH * scale + 0.5f));
+        int drawX = (smallW - drawW) / 2;
+        int drawY = (smallH - drawH) / 2;
+
+        // Low saturation + slight darkening + partial opacity.
+        Gdiplus::ColorMatrix cm = {{
+            {0.105f, 0.105f, 0.105f, 0.0f, 0.0f},
+            {0.205f, 0.205f, 0.205f, 0.0f, 0.0f},
+            {0.045f, 0.045f, 0.045f, 0.0f, 0.0f},
+            {0.0f,   0.0f,   0.0f,   0.36f, 0.0f},
+            {0.0f,   0.0f,   0.0f,   0.0f,  1.0f}
+        }};
+        Gdiplus::ImageAttributes attr;
+        attr.SetColorMatrix(&cm, Gdiplus::ColorMatrixFlagsDefault,
+                            Gdiplus::ColorAdjustTypeBitmap);
+
+        bg.DrawImage(&cover,
+            Gdiplus::Rect(drawX, drawY, drawW, drawH),
+            0, 0, m_coverBitmapW, m_coverBitmapH,
+            Gdiplus::UnitPixel,
+            &attr);
+
+        g.DrawImage(&blurred, Gdiplus::Rect(0, 0, m_width, m_height),
+            0, 0, smallW, smallH, Gdiplus::UnitPixel);
+
+        // A translucent charcoal veil binds the background back into the UI and
+        // keeps foreground contrast high.
+        Gdiplus::LinearGradientBrush veil(
+            Gdiplus::Point(0, 0), Gdiplus::Point(0, m_height),
+            Gdiplus::Color(118, 58, 61, 63),
+            Gdiplus::Color(168, 20, 22, 24));
+        g.FillRectangle(&veil, 0, 0, m_width, m_height);
+    }
 }
 
 void DanmakuEngine::drawTurntable(HDC dc) {
@@ -596,7 +650,7 @@ void DanmakuEngine::drawTurntable(HDC dc) {
     int jointX = pivotX + (int)(dirX * armLen * 0.62f);
     int jointY = pivotY + (int)(dirY * armLen * 0.62f);
     // Bend the second segment a bit toward the disc.
-    float bendAngle = angle + 0.12f;
+    float bendAngle = angle + 0.30f;
     int headX = jointX + (int)(cosf(bendAngle) * armLen * 0.42f);
     int headY = jointY + (int)(sinf(bendAngle) * armLen * 0.42f);
 
