@@ -126,6 +126,22 @@ bool DanmakuEngine::isArmLanded() const {
     return m_armLanded;
 }
 
+bool DanmakuEngine::isPointInCoverArea(int x, int y) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_width <= 80 || m_height <= 80) return false;
+    int panelMin = std::min(m_width, m_height);
+    int recordR = (int)((float)panelMin * 0.36f);
+    recordR = std::max(48, recordR);
+    recordR = std::min(recordR, std::min((int)(m_width * 0.42f), (int)(m_height * 0.42f)));
+    int cx = m_width / 2;
+    int cy = (int)(m_height * 0.47f);
+    if (m_height < 220) cy = m_height / 2;
+    int labelR = std::max(28, (int)(recordR * 0.68f));
+    int dx = x - cx;
+    int dy = y - cy;
+    return dx * dx + dy * dy <= labelR * labelR;
+}
+
 void DanmakuEngine::setConfig(const DanmakuConfig& config) {
     std::lock_guard<std::mutex> lock(m_mutex);
     int oldTracks = m_config.maxTracks;
@@ -244,7 +260,6 @@ void DanmakuEngine::onPaint(HDC hdc) {
 
 void DanmakuEngine::onTimer() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_config.enabled) return;
     DWORD now = GetTickCount();
     if (m_lastUpdateTick == 0) m_lastUpdateTick = now;
     DWORD deltaMs = now - m_lastUpdateTick;
@@ -274,42 +289,46 @@ void DanmakuEngine::onTimer() {
         return;   // audio paused: freeze scroll AND suspend drip
     }
 
-    updateDanmakuPositions(deltaSeconds);
+    if (m_config.enabled) {
+        updateDanmakuPositions(deltaSeconds);
+    }
     if (!m_paused) {
         m_recordAngle += deltaSeconds * std::max(0.0f, m_config.turntableSpeed);
         const float twoPi = 6.28318530718f;
         if (m_recordAngle > twoPi) m_recordAngle = fmodf(m_recordAngle, twoPi);
     }
 
-    // Decay tracked right-edges so they stay in sync with the items that own them.
-    for (auto& edge : m_trackRightEdge) {
-        if (edge > -1e8f) edge -= m_config.baseSpeed * deltaSeconds;
-    }
+    if (m_config.enabled) {
+        // Decay tracked right-edges so they stay in sync with the items that own them.
+        for (auto& edge : m_trackRightEdge) {
+            if (edge > -1e8f) edge -= m_config.baseSpeed * deltaSeconds;
+        }
 
     // Mark off-screen danmaku inactive.
-    for (auto& item : m_danmakuList) {
-        // Only remove after the final glyph has fully crossed the left edge.
-        if (item.x + item.width <= 0.0f) item.active = false;
-    }
+        for (auto& item : m_danmakuList) {
+            // Only remove after the final glyph has fully crossed the left edge.
+            if (item.x + item.width <= 0.0f) item.active = false;
+        }
 
     // Recycle tracks for items being dropped so trackUsage stays balanced.
-    for (auto& item : m_danmakuList) {
-        if (!item.active && item.track >= 0) {
-            recycleTrack(item.track);
-            item.track = -1;
+        for (auto& item : m_danmakuList) {
+            if (!item.active && item.track >= 0) {
+                recycleTrack(item.track);
+                item.track = -1;
+            }
         }
+
+        m_danmakuList.erase(
+            std::remove_if(m_danmakuList.begin(), m_danmakuList.end(),
+                [](const DanmakuItem& item) { return !item.active; }),
+            m_danmakuList.end()
+        );
+
+        // Drip a new item from the pool if there's clearance on any track. Loops
+        // back to index 0 when the pool is exhausted so the show continues until
+        // clearPool() is called (new song / stop).
+        dripFromPool();
     }
-
-    m_danmakuList.erase(
-        std::remove_if(m_danmakuList.begin(), m_danmakuList.end(),
-            [](const DanmakuItem& item) { return !item.active; }),
-        m_danmakuList.end()
-    );
-
-    // Drip a new item from the pool if there's clearance on any track. Loops
-    // back to index 0 when the pool is exhausted so the show continues until
-    // clearPool() is called (new song / stop).
-    dripFromPool();
 }
 
 void DanmakuEngine::setEnabled(bool enabled) {
@@ -458,14 +477,14 @@ void DanmakuEngine::drawTurntable(HDC dc) {
 
     // ── Record shadow / seat ────────────────────────────────────────
     // No glow/halo: just a controlled shadow between the outer contour and vinyl.
-    for (int k = 10; k >= 2; k -= 2) {
-        COLORREF c = RGB(9 + k, 11 + k, 15 + k);
+    for (int k = 12; k >= 2; k -= 2) {
+        COLORREF c = RGB(18 + k, 20 + k, 23 + k);
         HBRUSH br = CreateSolidBrush(c);
         HPEN pen = CreatePen(PS_SOLID, 1, c);
         HGDIOBJ oldB = SelectObject(dc, br);
         HGDIOBJ oldP = SelectObject(dc, pen);
-        Ellipse(dc, cx - recordR - k, cy - recordR - k + 3,
-                    cx + recordR + k, cy + recordR + k + 3);
+        Ellipse(dc, cx - recordR - k, cy - recordR + 4,
+                    cx + recordR + k, cy + recordR + 8 + k);
         SelectObject(dc, oldB);
         SelectObject(dc, oldP);
         DeleteObject(br);
@@ -556,7 +575,7 @@ void DanmakuEngine::drawTurntable(HDC dc) {
     // before so the base no longer visually intrudes into the record.
     int pivotX = cx + (int)(recordR * 1.12f);
     int pivotY = cy - (int)(recordR * 0.98f);
-    int armLen = (int)(recordR * 0.75f);
+    int armLen = (int)(recordR * 0.84f);
 
     // Screen Y points down, so positive angles rotate clockwise.
     // 0 -> parked: stylus sits outside the record, upper-right.
@@ -564,8 +583,8 @@ void DanmakuEngine::drawTurntable(HDC dc) {
     // vinyl / cover boundary, matching the reference image.
     // Parked: just outside the vinyl edge. Landed: the stylus reaches the
     // black vinyl ring, outside the large center cover area.
-    const float parkedAngle = 1.45f;
-    const float landedAngle = 2.33f;
+    const float parkedAngle = 1.30f;
+    const float landedAngle = 1.736f; // parked + ~25 degrees
     float p = m_armProgress;
     // smoothstep for an organic ease-in-out feel
     float pe = p * p * (3.0f - 2.0f * p);
@@ -584,8 +603,9 @@ void DanmakuEngine::drawTurntable(HDC dc) {
     int armThick = std::max(4, recordR / 22);
     int armThin  = std::max(3, recordR / 28);
 
-    // Soft drop shadow behind the arm so it pops off the dark vinyl.
-    HPEN shadowPen = CreatePen(PS_SOLID, armThick + 2, RGB(20, 16, 12));
+    // Soft drop shadow behind the arm: subtle, close to the metal, not a
+    // separate black "arm".
+    HPEN shadowPen = CreatePen(PS_SOLID, armThick + 2, RGB(24, 22, 20));
     HGDIOBJ oldPen = SelectObject(dc, shadowPen);
     MoveToEx(dc, pivotX + 2, pivotY + 3, nullptr);
     LineTo(dc, jointX + 2, jointY + 3);

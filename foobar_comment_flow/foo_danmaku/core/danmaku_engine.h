@@ -55,6 +55,10 @@ public:
     void setArmLanded(bool landed);
     bool isArmLanded() const;
 
+    // Hit-test the album-cover/center-label circle. Used by the UI to toggle
+    // danmaku display when the user clicks the cover area.
+    bool isPointInCoverArea(int x, int y) const;
+
 private:
     HWND m_hwnd;
     HDC m_memDC;

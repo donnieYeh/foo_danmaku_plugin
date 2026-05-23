@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <algorithm>
 
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "gdiplus.lib")
@@ -71,6 +72,9 @@ static void ensureGdiplusShutdown() {
 }
 
 // Decode raw image bytes (jpg/png/etc.) into a 32-bit DIB HBITMAP using GDI+.
+// Large embedded covers can make per-frame vinyl rotation expensive. If the
+// source image exceeds 1000x1000, downsample it in memory before handing it to
+// the engine. No temporary files are created.
 // Caller owns the returned HBITMAP. Returns nullptr on failure.
 static HBITMAP decodeCoverBytes(const void* data, size_t size) {
     if (!data || size == 0) return nullptr;
@@ -82,7 +86,25 @@ static HBITMAP decodeCoverBytes(const void* data, size_t size) {
     {
         Gdiplus::Bitmap bmp(stream, FALSE);
         if (bmp.GetLastStatus() == Gdiplus::Ok) {
-            bmp.GetHBITMAP(Gdiplus::Color(0, 0, 0), &out);
+            const UINT srcW = bmp.GetWidth();
+            const UINT srcH = bmp.GetHeight();
+            const UINT kMaxCoverSide = 1000;
+            if (srcW > kMaxCoverSide || srcH > kMaxCoverSide) {
+                float scale = std::min((float)kMaxCoverSide / (float)srcW,
+                                       (float)kMaxCoverSide / (float)srcH);
+                UINT dstW = std::max<UINT>(1, (UINT)(srcW * scale + 0.5f));
+                UINT dstH = std::max<UINT>(1, (UINT)(srcH * scale + 0.5f));
+                Gdiplus::Bitmap resized(dstW, dstH, PixelFormat32bppARGB);
+                Gdiplus::Graphics g(&resized);
+                g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+                g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+                g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+                g.DrawImage(&bmp, Gdiplus::Rect(0, 0, (INT)dstW, (INT)dstH),
+                            0, 0, srcW, srcH, Gdiplus::UnitPixel);
+                resized.GetHBITMAP(Gdiplus::Color(0, 0, 0), &out);
+            } else {
+                bmp.GetHBITMAP(Gdiplus::Color(0, 0, 0), &out);
+            }
         }
     }
     stream->Release();
@@ -622,6 +644,20 @@ LRESULT CALLBACK DanmakuUIWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam,
         return 1;
     case WM_TIMER:
         if (wParam == 1 && wnd) wnd->onTimer();
+        break;
+    case WM_LBUTTONUP:
+        if (wnd && wnd->m_engine) {
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
+            if (wnd->m_engine->isPointInCoverArea(x, y)) {
+                wnd->m_engine->setEnabled(!wnd->m_engine->isEnabled());
+                danmaku_log(wnd->m_engine->isEnabled()
+                    ? "[Danmaku] cover clicked -> danmaku shown"
+                    : "[Danmaku] cover clicked -> danmaku hidden");
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+        }
         break;
     case WM_SIZE: {
         if (wnd) {
