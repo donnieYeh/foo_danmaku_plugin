@@ -108,15 +108,22 @@ int music_client_reorder_providers(
 
 /* ── search ──────────────────────────────────────────── */
 
-/** Search for a song and return its platform ID plus optional cover-art URL.
+/** Search for a song and return its platform ID.
+ *
+ *  If @p out_cover_data is non-NULL the cover-art image is fetched from the
+ *  provider's CDN and returned as raw bytes (JPEG/PNG).  The caller must free
+ *  the buffer with music_client_free().  Cover download failure is non-fatal:
+ *  MUSIC_OK is still returned when the song was found; *out_cover_data will
+ *  simply be NULL.  Pass out_cover_data=NULL to skip the cover download.
+ *
  *  @return MUSIC_OK, MUSIC_ERR_NOTFOUND, or another MUSIC_ERR_* code. */
 int music_client_search_song(
     MusicClientHandle h,
     const wchar_t*    keyword,
     wchar_t*          out_song_id,
     int               song_id_buf_wchars,
-    wchar_t*          out_cover_url,      /* may be NULL */
-    int               cover_url_buf_wchars);
+    void**            out_cover_data,   /* may be NULL; free with music_client_free */
+    int*              out_cover_size);  /* may be NULL */
 
 /* ── comments ────────────────────────────────────────── */
 

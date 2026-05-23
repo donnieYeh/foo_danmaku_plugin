@@ -260,8 +260,13 @@ int ApiClient::get_comments_page(
     std::wstring&       error_msg)
 {
     out_delivered = 0;
-    int page_size = std::min(std::max(limit, 1), 100);
-    int page_num  = (page_size > 0) ? (offset / page_size) : 0;
+    /* QQ Music's fcg_global_comment_h5 consistently returns 10 comments per
+     * page for anonymous access regardless of the 'pagesize' request field.
+     * Fix kQQApiPageSize so page_num = offset/10 keeps correct page alignment
+     * as the streaming worker advances offset by the delivered count. */
+    const int kQQApiPageSize = 10;
+    int page_size = std::min(std::max(limit, 1), kQQApiPageSize);
+    int page_num  = offset / kQQApiPageSize;
 
     loga("get_comments_page mid=" + json::to_utf8(song_mid)
        + " offset=" + std::to_string(offset)

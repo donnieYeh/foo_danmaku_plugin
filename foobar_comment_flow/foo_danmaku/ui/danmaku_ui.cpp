@@ -144,17 +144,6 @@ static HBITMAP decodeCoverBytes(const void* data, size_t size) {
     return out;
 }
 
-static HBITMAP downloadAndDecodeCoverUrl(const wchar_t* url) {
-    if (!url || !*url || !g_music) return nullptr;
-    void* data = nullptr;
-    int   size = 0;
-    if (music_client_download_bytes(g_music, url, &data, &size) != MUSIC_OK || !data)
-        return nullptr;
-    HBITMAP bmp = decodeCoverBytes(data, static_cast<size_t>(size));
-    music_client_free(data);
-    return bmp;
-}
-
 static void fetchAndApplyCoverArtAsync(metadb_handle_ptr track, uint64_t gen);
 
 // Each new track bumps the generation; in-flight worker threads from prior
@@ -378,40 +367,42 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
 
         danmaku_log("[Danmaku] streaming worker: resolving song id\u2026");
 
-        // ── Step 1: resolve song id from "title artist" keyword ──────────
+        // ── Step 1: resolve song id (and optionally cover art) ──────────
         std::wstring kw = titleStr;
         if (!artistStr.empty()) kw += L" " + artistStr;
-        wchar_t song_id[64] = {0};
-        wchar_t cover_url[1024] = {0};
+        wchar_t song_id[64] = {};
+        void*   cover_data  = nullptr;
+        int     cover_size  = 0;
+        /* Only ask for cover bytes if the engine has no art yet. */
+        const bool want_cover = g_engine && !g_engine->hasCoverArt();
         int rc = music_client_search_song(
-            g_music, kw.c_str(), song_id, 64, cover_url, 1024);
+            g_music, kw.c_str(),
+            song_id, 64,
+            want_cover ? &cover_data : nullptr,
+            want_cover ? &cover_size  : nullptr);
         if (rc != MUSIC_OK) {
             std::wstring err = L"[Danmaku] search_song FAILED rc="
                              + std::to_wstring(rc)
                              + L" err=" + music_client_last_error(g_music);
             danmaku_logW(err.c_str());
+            music_client_free(cover_data);
             if (!cancelled()) g_fetching = false;
             return;
         }
-        if (cancelled()) { return; }
+        if (cancelled()) { music_client_free(cover_data); return; }
 
-        // If the local file has no embedded/front cover but NetEase search
-        // resolved comments and a cover URL, use NetEase's cover as the vinyl
-        // label and the ambient background. It goes through the same in-memory
-        // 1000x1000 cap in decodeCoverBytes().
-        if (cover_url[0] && g_engine && !g_engine->hasCoverArt()) {
-            HBITMAP neteaseCover = downloadAndDecodeCoverUrl(cover_url);
-            if (cancelled()) {
-                if (neteaseCover) DeleteObject(neteaseCover);
-                return;
+        /* Apply provider cover art if the engine still has none. */
+        if (cover_data) {
+            if (g_engine && !g_engine->hasCoverArt()) {
+                HBITMAP bmp = decodeCoverBytes(cover_data, (size_t)cover_size);
+                if (bmp) {
+                    g_engine->setCoverArt(bmp);
+                    danmaku_log("[Danmaku] provider cover applied");
+                    if (IsWindow(targetHwnd)) InvalidateRect(targetHwnd, nullptr, FALSE);
+                }
             }
-            if (neteaseCover && g_engine && !g_engine->hasCoverArt()) {
-                g_engine->setCoverArt(neteaseCover);
-                danmaku_log("[Danmaku] NetEase cover applied as fallback");
-                if (IsWindow(targetHwnd)) InvalidateRect(targetHwnd, nullptr, FALSE);
-            } else if (neteaseCover) {
-                DeleteObject(neteaseCover);
-            }
+            music_client_free(cover_data);
+            cover_data = nullptr;
         }
 
         // ── Step 2: fetch initial burst (one page of 100) so playback can start ──
@@ -437,8 +428,9 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
 
         if (IsWindow(targetHwnd)) InvalidateRect(targetHwnd, nullptr, FALSE);
 
-        // Server returned fewer than asked — already at end of stream.
-        bool serverExhausted = (delivered < kInitialBurst);
+        // Stop only when the server delivers 0 — providers may cap per-page
+        // items below kInitialBurst (e.g. QQ Music caps anonymous pages at 10).
+        bool serverExhausted = (delivered == 0);
         int  nextOffset      = delivered;
         int  pagesFetched    = 1;
 

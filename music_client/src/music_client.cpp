@@ -147,9 +147,11 @@ int music_client_search_song(
     const wchar_t*    keyword,
     wchar_t*          out_song_id,
     int               song_id_buf_wchars,
-    wchar_t*          out_cover_url,
-    int               cover_url_buf_wchars)
+    void**            out_cover_data,
+    int*              out_cover_size)
 {
+    if (out_cover_data) *out_cover_data = nullptr;
+    if (out_cover_size) *out_cover_size = 0;
     if (!h || !keyword || !out_song_id || song_id_buf_wchars < 2)
         return MUSIC_ERR_PARAM;
 
@@ -159,6 +161,9 @@ int music_client_search_song(
         return MUSIC_ERR_NO_PROVIDER;
     }
 
+    const bool want_cover = (out_cover_data && out_cover_size);
+    wchar_t cover_url[2048] = {}; /* internal buffer; never exposed to caller */
+
     /* Fallback: try each provider in priority order, stop at first success. */
     int last_rc = MUSIC_ERR_NO_PROVIDER;
     for (int i = 0; i < (int)c->providers.size(); i++) {
@@ -167,9 +172,15 @@ int music_client_search_song(
             s.handle,
             keyword,
             out_song_id, song_id_buf_wchars,
-            out_cover_url, cover_url_buf_wchars);
+            want_cover ? cover_url : nullptr,
+            want_cover ? (int)(_countof(cover_url)) : 0);
         if (rc == MUSIC_OK) {
             c->search_provider_idx = i;
+            /* Download cover art if the provider returned a URL */
+            if (want_cover && cover_url[0]) {
+                music_client_download_bytes(h, cover_url, out_cover_data, out_cover_size);
+                /* Non-fatal: song_id is valid even if cover download fails */
+            }
             return MUSIC_OK;
         }
         c->last_error = s.vtable->last_error(s.handle);
