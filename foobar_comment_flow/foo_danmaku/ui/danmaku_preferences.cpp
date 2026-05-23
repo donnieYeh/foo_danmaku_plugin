@@ -205,7 +205,7 @@ private:
             if (nm->hwndFrom == self->m_providerList && nm->code == LVN_BEGINDRAG) {
                 auto* nmlv = reinterpret_cast<NMLISTVIEW*>(lp);
                 self->m_dragSrc = nmlv->iItem;
-                self->m_dragDst = nmlv->iItem;
+                self->m_dragDst = -1;   /* gap not yet determined */
                 self->m_dragging = true;
                 SetCapture(hwnd);
                 return 0;
@@ -214,24 +214,40 @@ private:
         if (msg == WM_MOUSEMOVE && self->m_dragging) {
             POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             MapWindowPoints(hwnd, self->m_providerList, &pt, 1);
-            LVHITTESTINFO ht = {};
-            ht.pt = pt;
-            int idx = ListView_HitTest(self->m_providerList, &ht);
             int total = ListView_GetItemCount(self->m_providerList);
-            int dst = (idx >= 0) ? idx : (pt.y < 0 ? 0 : total - 1);
-            if (dst != self->m_dragDst) {
-                self->m_dragDst = dst;
-                LVINSERTMARK lim = { sizeof(LVINSERTMARK), 0, dst, 0 };
-                ListView_SetInsertMark(self->m_providerList, &lim);
+            /* Compute gap: 0 = before item 0, N = after item N-1 */
+            int gap = total;
+            for (int i = 0; i < total; i++) {
+                RECT rc = {};
+                ListView_GetItemRect(self->m_providerList, i, &rc, LVIR_BOUNDS);
+                if (pt.y < (rc.top + rc.bottom) / 2) { gap = i; break; }
+            }
+            if (gap != self->m_dragDst) {
+                self->m_dragDst = gap;
+                if (gap == 0) {
+                    LVINSERTMARK lim = { sizeof(LVINSERTMARK), 0, 0, 0 };
+                    ListView_SetInsertMark(self->m_providerList, &lim);
+                } else {
+                    /* Show mark AFTER item (gap-1) */
+                    LVINSERTMARK lim = { sizeof(LVINSERTMARK), 0x00000001 /*LVIMF_AFTER*/, gap - 1, 0 };
+                    ListView_SetInsertMark(self->m_providerList, &lim);
+                }
             }
             return 0;
         }
         if (msg == WM_LBUTTONUP && self->m_dragging) {
             self->m_dragging = false;
             ReleaseCapture();
-            ListView_SetInsertMark(self->m_providerList, nullptr);
-            if (self->m_dragSrc != self->m_dragDst) {
-                self->moveListItem(self->m_dragSrc, self->m_dragDst);
+            /* Safe clear — never pass nullptr; LVIMF_INVALID is the portable way */
+            LVINSERTMARK clr = { sizeof(LVINSERTMARK), 0xFFFFFFFF /*LVIMF_INVALID*/, -1, 0 };
+            ListView_SetInsertMark(self->m_providerList, &clr);
+            int src = self->m_dragSrc;
+            int gap = self->m_dragDst; /* gap index: 0..N */
+            /* gap==src means 'before src' (no-op), gap==src+1 means 'after src' (no-op) */
+            if (gap >= 0 && gap != src && gap != src + 1) {
+                /* When src < gap, deleting src shifts remaining items down by 1 */
+                int dst = (src < gap) ? gap - 1 : gap;
+                self->moveListItem(src, dst);
                 if (self->m_callback.is_valid()) self->m_callback->on_state_changed();
             }
             return 0;
