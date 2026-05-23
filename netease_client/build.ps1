@@ -36,12 +36,16 @@ $srcFiles = @(
     "$PROJECT\src\http.cpp",
     "$PROJECT\src\json.cpp",
     "$PROJECT\src\api.cpp",
-    "$PROJECT\src\netease_client.cpp"
+    "$PROJECT\src\netease_client.cpp",
+    "$PROJECT\src\provider_entry.cpp"   # MusicProviderVTable adapter
 )
+
+$MUSIC_CLIENT_INC = "$PROJECT\..\music_client\include"  # music_provider.h
 
 $includeArgs = @(
     "/I$PROJECT\include",
     "/I$PROJECT\src",
+    "/I$MUSIC_CLIENT_INC",
     "/I$WINSDK_INC\ucrt",
     "/I$WINSDK_INC\shared",
     "/I$WINSDK_INC\um",
@@ -83,13 +87,4 @@ Write-Host "Linking ($Platform)..."
 if ($LASTEXITCODE -ne 0) { Write-Host "LINK FAILED"; exit 1 }
 
 Write-Host "SUCCESS: $OUTDIR\netease_client.dll"
-
-# ── Copy artifacts to foo_danmaku SDK slot ──────────────
-$sdkSlot = "$PROJECT\..\foobar_comment_flow\foo_danmaku\SDK\netease_client"
-if (-not (Test-Path $sdkSlot))        { New-Item -ItemType Directory -Path $sdkSlot | Out-Null }
-if (-not (Test-Path "$sdkSlot\include")) { New-Item -ItemType Directory -Path "$sdkSlot\include" | Out-Null }
-
-Copy-Item "$PROJECT\include\netease_client.h"  "$sdkSlot\include\" -Force
-Copy-Item "$OUTDIR\netease_client.lib"          "$sdkSlot\"          -Force
-Copy-Item "$OUTDIR\netease_client.dll"          "$sdkSlot\"          -Force
-Write-Host "Artifacts copied to $sdkSlot"
+Write-Host "Headers : $PROJECT\include"

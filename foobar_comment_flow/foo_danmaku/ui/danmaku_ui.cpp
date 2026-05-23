@@ -3,14 +3,13 @@
 #include "ui/danmaku_preferences.h"
 #include "../core/danmaku_engine.h"
 #include "../core/playback_monitor.h"
-#include "netease_client.h"   // standalone NetEase comment library
+#include "music_client.h"    // Layer-2 music data client (static lib)
 #include <windows.h>
 #include <windowsx.h>
 #include <mmsystem.h>
 #include <objidl.h>
 #include <gdiplus.h>
 #include <shlwapi.h>
-#include <urlmon.h>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -21,7 +20,7 @@
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shlwapi.lib")
-#pragma comment(lib, "urlmon.lib")
+/* urlmon.lib is pulled in transitively by music_client.lib via #pragma comment */
 
 // ── logging helpers ──────────────────────────────────────
 // Writes to foobar2000's View→Console AND OutputDebugString.
@@ -54,7 +53,7 @@ const GUID g_danmaku_guid = { 0xa1b2c3d4, 0xe5f6, 0x7890, {0xab, 0xcd, 0xef, 0x1
 
 static DanmakuEngine*  g_engine  = nullptr;
 static PlaybackMonitor* g_monitor = nullptr;
-static NeteaseHandle    g_netease = nullptr;
+static MusicClientHandle g_music   = nullptr;
 static std::atomic<bool> g_fetching{false};
 
 // GDI+ token + ref count so multiple UI elements share one Startup/Shutdown.
@@ -145,23 +144,14 @@ static HBITMAP decodeCoverBytes(const void* data, size_t size) {
 }
 
 static HBITMAP downloadAndDecodeCoverUrl(const wchar_t* url) {
-    if (!url || !*url) return nullptr;
-    IStream* stream = nullptr;
-    HRESULT hr = URLOpenBlockingStreamW(nullptr, url, &stream, 0, nullptr);
-    if (FAILED(hr) || !stream) return nullptr;
-
-    std::vector<BYTE> bytes;
-    BYTE buf[8192];
-    for (;;) {
-        ULONG read = 0;
-        hr = stream->Read(buf, sizeof(buf), &read);
-        if (FAILED(hr) || read == 0) break;
-        bytes.insert(bytes.end(), buf, buf + read);
-        if (bytes.size() > 20 * 1024 * 1024) break; // sanity cap
-    }
-    stream->Release();
-    if (bytes.empty()) return nullptr;
-    return decodeCoverBytes(bytes.data(), bytes.size());
+    if (!url || !*url || !g_music) return nullptr;
+    void* data = nullptr;
+    int   size = 0;
+    if (music_client_download_bytes(g_music, url, &data, &size) != MUSIC_OK || !data)
+        return nullptr;
+    HBITMAP bmp = decodeCoverBytes(data, static_cast<size_t>(size));
+    music_client_free(data);
+    return bmp;
 }
 
 static void fetchAndApplyCoverArtAsync(metadb_handle_ptr track, uint64_t gen);
@@ -283,13 +273,31 @@ DanmakuUIInstance::DanmakuUIInstance(HWND parent, ui_element_instance_callback_p
     g_monitor->setOnNewTrack(onNewTrackCallback, m_wnd);
     g_monitor->setOnPlayState(onPlayStateCallback, m_wnd);
 
-    if (!g_netease) {
-        g_netease = netease_create(nullptr); // anonymous access
-        // Route all netease_client logs → foobar2000 View→Console
-        netease_set_global_log([](const wchar_t* msg, void*) {
+    if (!g_music) {
+        g_music = music_client_create();
+
+        // Route all music_client / provider logs → foobar2000 View→Console
+        music_client_set_log(g_music, [](const wchar_t* msg, void*) {
             danmaku_logW(msg);
         }, nullptr);
-        danmaku_log("[Danmaku] netease_client handle created, log callback registered");
+
+        // Resolve netease_client.dll path relative to foo_danmaku.dll
+        wchar_t provider_path[MAX_PATH] = {};
+        HMODULE self = GetModuleHandleW(L"foo_danmaku.dll");
+        if (self && GetModuleFileNameW(self, provider_path, MAX_PATH) > 0) {
+            wchar_t* sep = wcsrchr(provider_path, L'\\');
+            if (sep) wcscpy_s(sep + 1, MAX_PATH - (int)(sep + 1 - provider_path),
+                              L"netease_client.dll");
+        } else {
+            wcscpy_s(provider_path, L"netease_client.dll"); // fallback: DLL search path
+        }
+
+        int rc = music_client_load_provider(g_music, provider_path, nullptr);
+        if (rc != MUSIC_OK) {
+            danmaku_log("[Danmaku] WARNING: failed to load netease_client.dll");
+        } else {
+            danmaku_log("[Danmaku] music_client ready, netease provider loaded");
+        }
     }
 
     if (g_engine) {
@@ -333,15 +341,15 @@ DanmakuUIInstance::~DanmakuUIInstance() {
     delete g_engine;
     g_engine = nullptr;
 
-    if (g_netease) { netease_destroy(g_netease); g_netease = nullptr; }
+    if (g_music) { music_client_destroy(g_music); g_music = nullptr; }
 
     ensureGdiplusShutdown();
 }
 
 static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void* userdata) {
     DanmakuUIWindow* wnd = reinterpret_cast<DanmakuUIWindow*>(userdata);
-    if (!wnd || !g_netease || !g_engine) {
-        danmaku_log("[Danmaku] onNewTrack: guard failed (wnd/netease/engine null)");
+    if (!wnd || !g_music || !g_engine) {
+        danmaku_log("[Danmaku] onNewTrack: guard failed (wnd/music/engine null)");
         g_fetching = false;
         return;
     }
@@ -398,12 +406,12 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
         if (!artistStr.empty()) kw += L" " + artistStr;
         wchar_t song_id[64] = {0};
         wchar_t cover_url[1024] = {0};
-        int rc = netease_search_song_with_cover(
-            g_netease, kw.c_str(), song_id, 64, cover_url, 1024);
-        if (rc != NETEASE_OK) {
+        int rc = music_client_search_song(
+            g_music, kw.c_str(), song_id, 64, cover_url, 1024);
+        if (rc != MUSIC_OK) {
             std::wstring err = L"[Danmaku] search_song FAILED rc="
                              + std::to_wstring(rc)
-                             + L" err=" + netease_last_error(g_netease);
+                             + L" err=" + music_client_last_error(g_music);
             danmaku_logW(err.c_str());
             if (!cancelled()) g_fetching = false;
             return;
@@ -431,13 +439,13 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
 
         // ── Step 2: fetch initial burst (one page of 100) so playback can start ──
         int delivered = 0;
-        rc = netease_get_comments_by_id_paged(
-            g_netease, song_id, 0, kInitialBurst,
+        rc = music_client_get_comments_paged(
+            g_music, song_id, 0, kInitialBurst,
             comment_cb, g_engine, &delivered);
-        if (rc != NETEASE_OK) {
+        if (rc != MUSIC_OK) {
             std::wstring err = L"[Danmaku] initial page FAILED rc="
                              + std::to_wstring(rc)
-                             + L" err=" + netease_last_error(g_netease);
+                             + L" err=" + music_client_last_error(g_music);
             danmaku_logW(err.c_str());
             if (!cancelled()) g_fetching = false;
             return;
@@ -472,14 +480,14 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
             if (cancelled()) break;
 
             delivered = 0;
-            rc = netease_get_comments_by_id_paged(
-                g_netease, song_id, nextOffset, kPageSize,
+            rc = music_client_get_comments_paged(
+                g_music, song_id, nextOffset, kPageSize,
                 comment_cb, g_engine, &delivered);
-            if (rc != NETEASE_OK) {
+            if (rc != MUSIC_OK) {
                 std::wstring err = L"[Danmaku] page@"
                                  + std::to_wstring(nextOffset)
                                  + L" FAILED rc=" + std::to_wstring(rc)
-                                 + L" err=" + netease_last_error(g_netease);
+                                 + L" err=" + music_client_last_error(g_music);
                 danmaku_logW(err.c_str());
                 // Don't kill the loop on transient errors — back off and retry once.
                 Sleep(2000);

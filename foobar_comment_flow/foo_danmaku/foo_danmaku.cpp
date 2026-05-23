@@ -3,7 +3,6 @@
 #include "ui/danmaku_ui.h"
 #include "core/danmaku_engine.h"
 #include "core/playback_monitor.h"
-#include "netEase/api.h"
 #include <windows.h>
 
 DECLARE_COMPONENT_VERSION(

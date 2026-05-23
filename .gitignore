@@ -27,6 +27,7 @@ build/
 # IDE / OS noise
 .vs/
 .vscode/
+.windsurf/
 *.user
 *.suo
 *.VC.db
@@ -34,7 +35,17 @@ build/
 .DS_Store
 Thumbs.db
 
-# Keep vendored SDK/runtime DLLs trackable when explicitly needed.
-!**/SDK/**/*.dll
-!**/SDK/**/*.lib
-release/*
+# ── Vendor SDK (foobar2000 SDK, pfc, libPPUI) ─────────
+# Large vendor files; kept on disk for compilation but not tracked in git.
+# Reference: https://wiki.hydrogenaudio.org/index.php?title=Foobar2000:Development:SDK_Contents
+foobar_comment_flow/foo_danmaku/SDK/
+
+# ── Packaged releases ──────────────────────────────────
+foobar_comment_flow/dist/
+
+# ── Superseded / archived projects ────────────────────
+# netease_comments/ was an early Python proof-of-concept.
+# test_danmaku/ was a standalone C++ integration test for the old API.
+# Both superseded by the three-layer architecture.
+netease_comments/
+foobar_comment_flow/test_danmaku/

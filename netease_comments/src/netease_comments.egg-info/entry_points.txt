@@ -1,2 +1,0 @@
-[console_scripts]
-netease-comments = netease_comments.cli:app

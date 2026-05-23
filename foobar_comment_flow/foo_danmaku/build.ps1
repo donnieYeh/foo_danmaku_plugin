@@ -38,10 +38,18 @@ foreach ($required in @($clExe, $linkExe, $sharedLib)) {
     if (-not (Test-Path $required)) { throw "Required file not found: $required" }
 }
 
-# netease_client SDK slot (populated by netease_client/build.ps1)
-$NETEASE_SDK = "$SDK\netease_client"
-if (-not (Test-Path "$NETEASE_SDK\netease_client.lib")) {
-    throw "netease_client.lib not found in $NETEASE_SDK.`nRun netease_client/build.ps1 first."
+# Layer 2: music_client (static lib) — direct reference to sibling project
+$MUSIC_ROOT = "$PROJECT\..\..\music_client"
+$MUSIC_INC  = "$MUSIC_ROOT\include"
+$MUSIC_LIB  = "$MUSIC_ROOT\build\$Platform\music_client.lib"
+if (-not (Test-Path $MUSIC_LIB)) {
+    throw "music_client.lib not found: $MUSIC_LIB`nRun music_client/build.ps1 -Platform $Platform first."
+}
+
+# Layer 3: netease_client (provider DLL) — loaded at runtime via LoadLibraryW
+$NETEASE_DLL = "$PROJECT\..\..\netease_client\build\$Platform\netease_client.dll"
+if (-not (Test-Path $NETEASE_DLL)) {
+    throw "netease_client.dll not found: $NETEASE_DLL`nRun netease_client/build.ps1 -Platform $Platform first."
 }
 
 $projectSrc = @(
@@ -106,7 +114,7 @@ $includeArgs = @(
     "/I$SDK\foobar2000",
     "/I$SDK\foobar2000\SDK",
     "/I$SDK\foobar2000\helpers",
-    "/I$NETEASE_SDK\include"   # netease_client.h
+    "/I$MUSIC_INC"             # music_client.h + music_provider.h
 )
 
 $compileFlags = @(
@@ -139,10 +147,12 @@ $linkFlags = @(
     "/LIBPATH:$WINSDK_LIB\um\$libArch",
     "/LIBPATH:$WINSDK_LIB\ucrt\$libArch",
     "/LIBPATH:$MSVC\lib\$libArch",
-    "/LIBPATH:$NETEASE_SDK",    # netease_client.lib
+    "/LIBPATH:$MUSIC_ROOT\build\$Platform",  # music_client.lib (static, Layer 2)
     "kernel32.lib", "user32.lib", "gdi32.lib",
     "advapi32.lib", "shell32.lib", "ole32.lib", "uuid.lib",
-    "netease_client.lib",
+    "music_client.lib",
+    # netease_client.lib is NOT linked here — it is loaded at runtime
+    # by music_client via LoadLibraryW.
     $sharedLib
 )
 
@@ -166,11 +176,11 @@ if (Test-Path $fb2k) {
     if ($proc) { $proc | Stop-Process -Force; Start-Sleep -Seconds 2 }
     try {
         Copy-Item "$OUTDIR\foo_danmaku.dll"          "$fb2k\foo_danmaku.dll"    -Force -ErrorAction Stop
-        Copy-Item "$NETEASE_SDK\netease_client.dll"  "$fb2k\netease_client.dll" -Force -ErrorAction Stop
+        Copy-Item $NETEASE_DLL                       "$fb2k\netease_client.dll" -Force -ErrorAction Stop
         Write-Host "Deployed to $fb2k"
     } catch {
         Write-Host "WARN: Deploy needs admin rights. Copy manually:"
-        Write-Host "  $OUTDIR\foo_danmaku.dll  →  $fb2k\"
-        Write-Host "  $NETEASE_SDK\netease_client.dll  →  $fb2k\"
+        Write-Host "  $OUTDIR\foo_danmaku.dll       ->  $fb2k\"
+        Write-Host "  $NETEASE_DLL  ->  $fb2k\"
     }
 }
