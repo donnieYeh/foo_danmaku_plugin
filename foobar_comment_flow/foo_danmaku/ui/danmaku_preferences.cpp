@@ -16,6 +16,10 @@ static constexpr GUID guid_cfg_track_count =
 static constexpr GUID guid_cfg_speed_percent =
 { 0x80e1d472, 0xb84e, 0x4cc6, { 0x98, 0x13, 0x28, 0xe0, 0xb9, 0x57, 0xb0, 0x4c } };
 
+// {C2C18B7E-E550-42AB-93C7-7E5D04CB8E93}
+static constexpr GUID guid_cfg_turntable_speed_percent =
+{ 0xc2c18b7e, 0xe550, 0x42ab, { 0x93, 0xc7, 0x7e, 0x5d, 0x04, 0xcb, 0x8e, 0x93 } };
+
 // {1A0C9E11-74A4-49C7-904A-B2C2BB566F87}
 static constexpr GUID guid_pref_page =
 { 0x1a0c9e11, 0x74a4, 0x49c7, { 0x90, 0x4a, 0xb2, 0xc2, 0xbb, 0x56, 0x6f, 0x87 } };
@@ -29,10 +33,14 @@ static constexpr int kMaxTrackCount = 10;
 static constexpr int kDefaultSpeedPercent = 200; // 2x historical speed
 static constexpr int kMinSpeedPercent = 50;
 static constexpr int kMaxSpeedPercent = 300;
+static constexpr int kDefaultTurntableSpeedPercent = 100;
+static constexpr int kMinTurntableSpeedPercent = 20;
+static constexpr int kMaxTurntableSpeedPercent = 300;
 
 static cfg_int g_cfg_spawn_interval(guid_cfg_spawn_interval, kDefaultSpawnIntervalMs);
 static cfg_int g_cfg_track_count(guid_cfg_track_count, kDefaultTrackCount);
 static cfg_int g_cfg_speed_percent(guid_cfg_speed_percent, kDefaultSpeedPercent);
+static cfg_int g_cfg_turntable_speed_percent(guid_cfg_turntable_speed_percent, kDefaultTurntableSpeedPercent);
 
 static int clamp_interval(int v) {
     return std::max(kMinSpawnIntervalMs, std::min(kMaxSpawnIntervalMs, v));
@@ -42,6 +50,9 @@ static int clamp_tracks(int v) {
 }
 static int clamp_speed(int v) {
     return std::max(kMinSpeedPercent, std::min(kMaxSpeedPercent, v));
+}
+static int clamp_turntable_speed(int v) {
+    return std::max(kMinTurntableSpeedPercent, std::min(kMaxTurntableSpeedPercent, v));
 }
 
 int danmaku_default_spawn_interval_ms() { return kDefaultSpawnIntervalMs; }
@@ -57,12 +68,19 @@ float danmaku_get_base_speed() {
     // Historical base was 2px/frame at ~60fps = 120px/s.
     return 120.0f * ((float)danmaku_get_speed_percent() / 100.0f);
 }
+int danmaku_default_turntable_speed_percent() { return kDefaultTurntableSpeedPercent; }
+int danmaku_get_turntable_speed_percent() { return clamp_turntable_speed((int)g_cfg_turntable_speed_percent.get()); }
+void danmaku_set_turntable_speed_percent(int value) { g_cfg_turntable_speed_percent = clamp_turntable_speed(value); }
+float danmaku_get_turntable_speed() {
+    return 0.42f * ((float)danmaku_get_turntable_speed_percent() / 100.0f);
+}
 
 class DanmakuPreferencesInstance : public preferences_page_instance {
 public:
     DanmakuPreferencesInstance(HWND parent, preferences_page_callback::ptr cb)
         : m_parent(parent), m_callback(cb), m_wnd(nullptr),
-          m_intervalEdit(nullptr), m_tracksEdit(nullptr), m_speedEdit(nullptr) {
+          m_intervalEdit(nullptr), m_tracksEdit(nullptr), m_speedEdit(nullptr),
+          m_turntableSpeedEdit(nullptr) {
         createWindow();
     }
 
@@ -82,9 +100,11 @@ public:
         danmaku_set_spawn_interval_ms(readInt(m_intervalEdit, kDefaultSpawnIntervalMs, clamp_interval));
         danmaku_set_track_count(readInt(m_tracksEdit, kDefaultTrackCount, clamp_tracks));
         danmaku_set_speed_percent(readInt(m_speedEdit, kDefaultSpeedPercent, clamp_speed));
+        danmaku_set_turntable_speed_percent(readInt(m_turntableSpeedEdit, kDefaultTurntableSpeedPercent, clamp_turntable_speed));
         writeEdit(danmaku_get_spawn_interval_ms());
         writeTracks(danmaku_get_track_count());
         writeSpeed(danmaku_get_speed_percent());
+        writeTurntableSpeed(danmaku_get_turntable_speed_percent());
         if (m_callback.is_valid()) m_callback->on_state_changed();
     }
 
@@ -92,11 +112,12 @@ public:
         writeEdit(kDefaultSpawnIntervalMs);
         writeTracks(kDefaultTrackCount);
         writeSpeed(kDefaultSpeedPercent);
+        writeTurntableSpeed(kDefaultTurntableSpeedPercent);
         if (m_callback.is_valid()) m_callback->on_state_changed();
     }
 
 private:
-    enum { IDC_INTERVAL = 1001, IDC_TRACKS = 1002, IDC_SPEED = 1003 };
+    enum { IDC_INTERVAL = 1001, IDC_TRACKS = 1002, IDC_SPEED = 1003, IDC_TURNTABLE_SPEED = 1004 };
 
     HWND m_parent;
     preferences_page_callback::ptr m_callback;
@@ -104,6 +125,7 @@ private:
     HWND m_intervalEdit;
     HWND m_tracksEdit;
     HWND m_speedEdit;
+    HWND m_turntableSpeedEdit;
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* self = reinterpret_cast<DanmakuPreferencesInstance*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
@@ -114,7 +136,7 @@ private:
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
         if (self && msg == WM_COMMAND &&
-            (LOWORD(wp) == IDC_INTERVAL || LOWORD(wp) == IDC_TRACKS || LOWORD(wp) == IDC_SPEED) &&
+            (LOWORD(wp) == IDC_INTERVAL || LOWORD(wp) == IDC_TRACKS || LOWORD(wp) == IDC_SPEED || LOWORD(wp) == IDC_TURNTABLE_SPEED) &&
             HIWORD(wp) == EN_CHANGE) {
             if (self->m_callback.is_valid()) self->m_callback->on_state_changed();
             return 0;
@@ -181,16 +203,32 @@ private:
             112, 171, 520, 20, m_wnd, nullptr, inst, nullptr);
 
         CreateWindowExW(0, L"STATIC",
-            L"Settings take effect immediately after Apply.",
+            L"Turntable rotation speed (%):",
             WS_CHILD | WS_VISIBLE,
             12, 206, 560, 20, m_wnd, nullptr, inst, nullptr);
+
+        m_turntableSpeedEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL,
+            12, 232, 90, 24, m_wnd, (HMENU)(INT_PTR)IDC_TURNTABLE_SPEED, inst, nullptr);
+
+        CreateWindowExW(0, L"STATIC",
+            L"Default: 100. Smaller = slower vinyl rotation. Suggested range: 60-150.",
+            WS_CHILD | WS_VISIBLE,
+            112, 235, 560, 20, m_wnd, nullptr, inst, nullptr);
+
+        CreateWindowExW(0, L"STATIC",
+            L"Settings take effect immediately after Apply.",
+            WS_CHILD | WS_VISIBLE,
+            12, 270, 560, 20, m_wnd, nullptr, inst, nullptr);
 
         SendMessageW(m_intervalEdit, EM_SETLIMITTEXT, 5, 0);
         SendMessageW(m_tracksEdit, EM_SETLIMITTEXT, 2, 0);
         SendMessageW(m_speedEdit, EM_SETLIMITTEXT, 3, 0);
+        SendMessageW(m_turntableSpeedEdit, EM_SETLIMITTEXT, 3, 0);
         writeEdit(danmaku_get_spawn_interval_ms());
         writeTracks(danmaku_get_track_count());
         writeSpeed(danmaku_get_speed_percent());
+        writeTurntableSpeed(danmaku_get_turntable_speed_percent());
     }
 
     int readInt(HWND edit, int defaultValue, int (*clampFn)(int)) const {
@@ -216,11 +254,17 @@ private:
         swprintf_s(buf, L"%d", clamp_speed(v));
         SetWindowTextW(m_speedEdit, buf);
     }
+    void writeTurntableSpeed(int v) {
+        wchar_t buf[32];
+        swprintf_s(buf, L"%d", clamp_turntable_speed(v));
+        SetWindowTextW(m_turntableSpeedEdit, buf);
+    }
 
     bool hasChanged() const {
         return readInt(m_intervalEdit, kDefaultSpawnIntervalMs, clamp_interval) != danmaku_get_spawn_interval_ms() ||
                readInt(m_tracksEdit, kDefaultTrackCount, clamp_tracks) != danmaku_get_track_count() ||
-               readInt(m_speedEdit, kDefaultSpeedPercent, clamp_speed) != danmaku_get_speed_percent();
+               readInt(m_speedEdit, kDefaultSpeedPercent, clamp_speed) != danmaku_get_speed_percent() ||
+               readInt(m_turntableSpeedEdit, kDefaultTurntableSpeedPercent, clamp_turntable_speed) != danmaku_get_turntable_speed_percent();
     }
 };
 

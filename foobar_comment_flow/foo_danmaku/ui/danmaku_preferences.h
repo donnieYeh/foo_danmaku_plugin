@@ -18,4 +18,9 @@ void danmaku_set_speed_percent(int value);
 int danmaku_default_speed_percent();
 float danmaku_get_base_speed();
 
+int danmaku_get_turntable_speed_percent();
+void danmaku_set_turntable_speed_percent(int value);
+int danmaku_default_turntable_speed_percent();
+float danmaku_get_turntable_speed();
+
 #endif // DANMAKU_PREFERENCES_H

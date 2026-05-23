@@ -7,11 +7,16 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <mmsystem.h>
+#include <objidl.h>
+#include <gdiplus.h>
+#include <shlwapi.h>
 #include <string>
 #include <thread>
 #include <atomic>
 
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "shlwapi.lib")
 
 // ── logging helpers ──────────────────────────────────────
 // Writes to foobar2000's View→Console AND OutputDebugString.
@@ -46,6 +51,45 @@ static DanmakuEngine*  g_engine  = nullptr;
 static PlaybackMonitor* g_monitor = nullptr;
 static NeteaseHandle    g_netease = nullptr;
 static std::atomic<bool> g_fetching{false};
+
+// GDI+ token + ref count so multiple UI elements share one Startup/Shutdown.
+static ULONG_PTR        g_gdiplusToken = 0;
+static int              g_gdiplusRefs  = 0;
+
+static void ensureGdiplusStartup() {
+    if (g_gdiplusRefs++ == 0) {
+        Gdiplus::GdiplusStartupInput input;
+        Gdiplus::GdiplusStartup(&g_gdiplusToken, &input, nullptr);
+    }
+}
+static void ensureGdiplusShutdown() {
+    if (--g_gdiplusRefs <= 0 && g_gdiplusToken) {
+        Gdiplus::GdiplusShutdown(g_gdiplusToken);
+        g_gdiplusToken = 0;
+        g_gdiplusRefs  = 0;
+    }
+}
+
+// Decode raw image bytes (jpg/png/etc.) into a 32-bit DIB HBITMAP using GDI+.
+// Caller owns the returned HBITMAP. Returns nullptr on failure.
+static HBITMAP decodeCoverBytes(const void* data, size_t size) {
+    if (!data || size == 0) return nullptr;
+    IStream* stream = SHCreateMemStream(
+        reinterpret_cast<const BYTE*>(data),
+        (UINT)size);
+    if (!stream) return nullptr;
+    HBITMAP out = nullptr;
+    {
+        Gdiplus::Bitmap bmp(stream, FALSE);
+        if (bmp.GetLastStatus() == Gdiplus::Ok) {
+            bmp.GetHBITMAP(Gdiplus::Color(0, 0, 0), &out);
+        }
+    }
+    stream->Release();
+    return out;
+}
+
+static void fetchAndApplyCoverArtAsync(metadb_handle_ptr track, uint64_t gen);
 
 // Each new track bumps the generation; in-flight worker threads from prior
 // tracks detect the mismatch and exit immediately. Atomic so the worker
@@ -82,6 +126,48 @@ static int __stdcall comment_cb(
 
 static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void* userdata);
 static void onPlayStateCallback(bool playing, void* userdata);
+
+static void fetchAndApplyCoverArtAsync(metadb_handle_ptr track, uint64_t gen) {
+    if (track.is_empty() || !g_engine) return;
+    std::thread([track, gen]() {
+        try {
+            auto api = album_art_manager_v2::get();
+            metadb_handle_list list;
+            list.add_item(track);
+            pfc::list_t<GUID> ids;
+            ids.add_item(album_art_ids::cover_front);
+            abort_callback_dummy abort;
+            auto extractor = api->open(list, ids, abort);
+            if (extractor.is_empty()) return;
+            album_art_data_ptr blob;
+            try {
+                blob = extractor->query(album_art_ids::cover_front, abort);
+            } catch (...) {
+                return;
+            }
+            if (blob.is_empty()) return;
+
+            HBITMAP bmp = decodeCoverBytes(blob->get_ptr(), blob->get_size());
+            if (!bmp) {
+                danmaku_log("[Danmaku] cover art decode failed");
+                return;
+            }
+            // If the track changed while we were fetching, drop this cover.
+            if (g_trackGen.load() != gen) {
+                DeleteObject(bmp);
+                return;
+            }
+            if (g_engine) {
+                g_engine->setCoverArt(bmp); // engine takes ownership
+                danmaku_log("[Danmaku] cover art applied to vinyl label");
+            } else {
+                DeleteObject(bmp);
+            }
+        } catch (...) {
+            danmaku_log("[Danmaku] cover art fetch threw");
+        }
+    }).detach();
+}
 
 DanmakuUI::DanmakuUI() {}
 
@@ -136,7 +222,18 @@ DanmakuUIInstance::DanmakuUIInstance(HWND parent, ui_element_instance_callback_p
         cfg.spawnIntervalMs = danmaku_get_spawn_interval_ms();
         cfg.maxTracks = danmaku_get_track_count();
         cfg.baseSpeed = danmaku_get_base_speed();
+        cfg.turntableSpeed = danmaku_get_turntable_speed();
         g_engine->setConfig(cfg);
+    }
+
+    ensureGdiplusStartup();
+
+    // If something is already playing when the UI is created, seed cover + arm.
+    if (g_monitor) {
+        metadb_handle_ptr cur = g_monitor->getCurrentTrack();
+        if (!cur.is_empty()) {
+            fetchAndApplyCoverArtAsync(cur, g_trackGen.load());
+        }
     }
 }
 
@@ -162,6 +259,8 @@ DanmakuUIInstance::~DanmakuUIInstance() {
     g_engine = nullptr;
 
     if (g_netease) { netease_destroy(g_netease); g_netease = nullptr; }
+
+    ensureGdiplusShutdown();
 }
 
 static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void* userdata) {
@@ -198,6 +297,13 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
     }
     g_engine->clearPool();
     g_comment_count = 0;
+
+    // Drop the previous album art immediately so we don't show stale cover
+    // while the new one is being fetched.
+    g_engine->setCoverArt(nullptr);
+    if (g_monitor) {
+        fetchAndApplyCoverArtAsync(g_monitor->getCurrentTrack(), gen);
+    }
 
     std::thread([targetHwnd, titleStr, artistStr, gen]() {
         const int  kInitialBurst   = 100;   // first batch — enough to start playing
@@ -312,8 +418,9 @@ static void onPlayStateCallback(bool playing, void* userdata) {
     (void)userdata;
     if (!g_engine) return;
     g_engine->setPaused(!playing);
-    danmaku_log(playing ? "[Danmaku] playback resumed -> danmaku resumed"
-                        : "[Danmaku] playback paused/stopped -> danmaku paused");
+    g_engine->setArmLanded(playing); // arm onto disc while playing, lift on pause/stop
+    danmaku_log(playing ? "[Danmaku] playback resumed -> danmaku resumed, arm landing"
+                        : "[Danmaku] playback paused/stopped -> danmaku paused, arm lifting");
 }
 
 DanmakuUIWindow::DanmakuUIWindow(HWND parent)
@@ -460,12 +567,15 @@ void DanmakuUIWindow::onTimer() {
         int prefInterval = danmaku_get_spawn_interval_ms();
         int prefTracks = danmaku_get_track_count();
         float prefSpeed = danmaku_get_base_speed();
+        float prefTurntableSpeed = danmaku_get_turntable_speed();
         if (cfg.spawnIntervalMs != prefInterval ||
             cfg.maxTracks != prefTracks ||
-            cfg.baseSpeed != prefSpeed) {
+            cfg.baseSpeed != prefSpeed ||
+            cfg.turntableSpeed != prefTurntableSpeed) {
             cfg.spawnIntervalMs = prefInterval;
             cfg.maxTracks = prefTracks;
             cfg.baseSpeed = prefSpeed;
+            cfg.turntableSpeed = prefTurntableSpeed;
             m_engine->setConfig(cfg);
         }
         m_engine->onTimer();

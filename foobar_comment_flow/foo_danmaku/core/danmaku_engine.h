@@ -44,13 +44,30 @@ public:
     void resize(int width, int height);
     void setHwnd(HWND hwnd);
 
+    // Album art shown as the spinning vinyl label. The engine takes ownership
+    // of the HBITMAP and will DeleteObject it on replacement / shutdown.
+    // Pass nullptr to clear the cover and fall back to the decorative wedges.
+    void setCoverArt(HBITMAP bitmap);
+
+    // Toggles the tone-arm landing animation. When true the arm swings onto
+    // the record; when false it parks at the rest position outside the disc.
+    // The animation is driven by onTimer() using time-based easing.
+    void setArmLanded(bool landed);
+    bool isArmLanded() const;
+
 private:
     HWND m_hwnd;
     HDC m_memDC;
     HBITMAP m_memBM;
     HFONT m_font;     // cached, created once, not per-frame
+    HBITMAP m_coverBitmap; // optional album art rendered onto the vinyl label
+    int     m_coverBitmapW;
+    int     m_coverBitmapH;
     int m_width;
     int m_height;
+    float m_recordAngle; // decorative vinyl rotation angle, radians
+    bool  m_armLanded;       // target state: arm on disc (true) or parked off-disc (false)
+    float m_armProgress;     // eased current progress, 0=parked, 1=landed
     DanmakuConfig m_config;
     std::vector<DanmakuItem> m_danmakuList;
     std::vector<int> m_trackUsage;  // track usage counter for collision avoidance
@@ -68,6 +85,8 @@ private:
 
     void updateDanmakuPositions(float deltaSeconds);
     float measureTextWidth(const std::wstring& text) const;
+    void drawSoftBackground(HDC dc);
+    void drawTurntable(HDC dc);
     int allocateTrack();
     void recycleTrack(int track);
     void dripFromPool();      // try to spawn next pool item if any track has room

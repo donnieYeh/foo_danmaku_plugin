@@ -28,13 +28,15 @@ struct DanmakuConfig {
     int opacity;         // 0-255 (unused for now)
     int spawnGapPx;      // min horizontal gap (on the same track) before next spawn
     int spawnIntervalMs; // global min time between any two consecutive spawns
+    float turntableSpeed; // vinyl rotation speed, radians/second
 
     // Density-tuned defaults: 4 lanes (wider vertical spacing), 5s global
     // cooldown, and 2x the original 2px@60fps scroll speed (240px/s).
     // spawnGapPx <= 0 means dynamic same-lane gap: at least half the panel width.
     DanmakuConfig() : maxTracks(4), maxDanmaku(60), baseSpeed(240.0f),
                       enabled(true), opacity(230),
-                      spawnGapPx(0), spawnIntervalMs(5000) {}
+                      spawnGapPx(0), spawnIntervalMs(5000),
+                      turntableSpeed(0.42f) {}
 };
 
 // One immutable entry in the engine's comment pool. The engine drips these

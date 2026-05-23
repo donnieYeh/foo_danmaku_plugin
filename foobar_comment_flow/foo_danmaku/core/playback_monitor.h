@@ -18,6 +18,11 @@ public:
     void setOnNewTrack(OnNewTrackCallback cb, void* userdata);
     void setOnPlayState(OnPlayStateCallback cb, void* userdata);
 
+    // Latest metadb handle reported by foobar2000; used by the UI to fetch
+    // album art on a worker thread. Returns an empty handle when nothing
+    // is currently playing.
+    metadb_handle_ptr getCurrentTrack() const { return m_currentTrack; }
+
 private:
     void on_playback_starting(play_control::t_track_command p_command, bool p_paused) override;
     void on_playback_new_track(metadb_handle_ptr p_track) override;
@@ -37,6 +42,7 @@ private:
     OnPlayStateCallback m_onPlayState;
     void* m_userdata;
     bool m_registered;
+    metadb_handle_ptr m_currentTrack;
 };
 
 #endif // PLAYBACK_MONITOR_H

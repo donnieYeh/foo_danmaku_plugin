@@ -50,6 +50,7 @@ void PlaybackMonitor::on_playback_starting(play_control::t_track_command p_comma
 }
 
 void PlaybackMonitor::on_playback_new_track(metadb_handle_ptr p_track) {
+    m_currentTrack = p_track;
     if (!m_onNewTrack || p_track.is_empty()) return;
 
     std::wstring title = formatTrackField(p_track, "[%title%]");
