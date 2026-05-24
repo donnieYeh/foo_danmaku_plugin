@@ -1,5 +1,5 @@
 param(
-    [string]$Version  = "2.0.2",
+    [string]$Version  = "",
     [ValidateSet("x64","Win32")]
     [string]$Platform = "x64"   # 仅用于选择构建产物来源，不影响包内结构
 )
@@ -7,6 +7,25 @@ param(
 $ErrorActionPreference = "Stop"
 
 $PROJECT    = $PSScriptRoot
+$REPO_ROOT   = Resolve-Path "$PROJECT\.."
+
+function Get-LatestGitTagVersion {
+    Push-Location $REPO_ROOT
+    try {
+        $tag = (git tag --sort=-v:refname | Select-Object -First 1)
+        if (-not $tag) {
+            throw "No Git tags found. Pass -Version explicitly or create a version tag."
+        }
+        return ($tag -replace '^[vV]', '')
+    } finally {
+        Pop-Location
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = Get-LatestGitTagVersion
+}
+
 $FOO_DANMAKU_DLL = "$PROJECT\foo_danmaku\build\$Platform\foo_danmaku.dll"
 $NETEASE_DLL     = "$PROJECT\..\netease_client\build\$Platform\netease_client.dll"
 $QQMUSIC_DLL     = "$PROJECT\..\qqmusic_client\build\$Platform\qqmusic_client.dll"

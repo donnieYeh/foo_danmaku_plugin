@@ -63,15 +63,16 @@ typedef struct MusicProviderVTable {
      *
      *  @param out_song_id       Receives the platform-specific song ID string
      *                           that will be passed to get_comments_paged.
-     *  @param out_cover_url     Receives a direct HTTPS CDN URL for the album
-     *                           art image (JPEG/PNG).  May be NULL if the
-     *                           caller does not need cover art.
+     *  @param out_cover_url     Internal Layer-2 handoff only: receives a
+     *                           direct HTTPS CDN URL for the album art image
+     *                           (JPEG/PNG).  May be NULL if the caller does not
+     *                           need cover art.
      *                           Rules for providers:
      *                           - Must be a direct downloadable URL; do NOT
      *                             return a redirect chain or data-URI.
-     *                           - Layer-2 (music_client) will download this
-     *                             URL itself; the provider must not download
-     *                             it.
+     *                           - Layer-2 (music_client) downloads this URL as
+     *                             part of one atomic public operation; Layer 1
+     *                             callers never see or pass this URL around.
      *                           - Leave the buffer empty (buf[0]=0) if no
      *                             cover is available; this is not an error.
      *  @return 0 (MUSIC_OK) or a negative MUSIC_ERR_* code. */

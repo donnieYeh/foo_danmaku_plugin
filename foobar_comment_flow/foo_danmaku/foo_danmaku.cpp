@@ -7,7 +7,7 @@
 
 DECLARE_COMPONENT_VERSION(
     "FooBar Danmaku",
-    "2.0.2",
+    "2.1.0",
     "Fetches NetEase Cloud Music comments for the currently playing song and displays them as scrolling danmaku."
 );
 

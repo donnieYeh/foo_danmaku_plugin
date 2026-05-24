@@ -144,7 +144,12 @@ static HBITMAP decodeCoverBytes(const void* data, size_t size) {
     return out;
 }
 
-static void fetchAndApplyCoverArtAsync(metadb_handle_ptr track, uint64_t gen);
+static void fetchAndApplyCoverArtAsync(
+    metadb_handle_ptr   track,
+    uint64_t            gen,
+    MusicTrackSessionHandle session = nullptr,
+    HWND                invalidateHwnd  = nullptr,
+    std::shared_ptr<std::atomic<bool>> done = nullptr);
 
 // Each new track bumps the generation; in-flight worker threads from prior
 // tracks detect the mismatch and exit immediately. Atomic so the worker
@@ -182,10 +187,40 @@ static int __stdcall comment_cb(
 static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void* userdata);
 static void onPlayStateCallback(bool playing, void* userdata);
 
-static void fetchAndApplyCoverArtAsync(metadb_handle_ptr track, uint64_t gen) {
-    if (track.is_empty() || !g_engine) return;
-    std::thread([track, gen]() {
+static void fetchAndApplyCoverArtAsync(
+    metadb_handle_ptr track,
+    uint64_t          gen,
+    MusicTrackSessionHandle session,
+    HWND              invalidateHwnd,
+    std::shared_ptr<std::atomic<bool>> done)
+{
+    if (track.is_empty() || !g_engine) {
+        if (done) *done = true;
+        return;
+    }
+    std::thread([track, gen, session, invalidateHwnd, done]() {
+        auto cancelled = [gen]() {
+            return g_trackGen.load() != gen;
+        };
+        auto apply_bitmap = [gen, invalidateHwnd, cancelled](HBITMAP bmp, const char* sourceLog) {
+            if (!bmp) return false;
+            if (cancelled()) {
+                DeleteObject(bmp);
+                return false;
+            }
+            if (g_engine && !g_engine->hasCoverArt()) {
+                g_engine->setCoverArt(bmp); // engine takes ownership
+                danmaku_log(sourceLog);
+                if (invalidateHwnd && IsWindow(invalidateHwnd))
+                    InvalidateRect(invalidateHwnd, nullptr, FALSE);
+                return true;
+            }
+            DeleteObject(bmp);
+            return false;
+        };
+
         try {
+            bool localCoverApplied = false;
             auto api = album_art_manager_v2::get();
             metadb_handle_list list;
             list.add_item(track);
@@ -193,34 +228,62 @@ static void fetchAndApplyCoverArtAsync(metadb_handle_ptr track, uint64_t gen) {
             ids.add_item(album_art_ids::cover_front);
             abort_callback_dummy abort;
             auto extractor = api->open(list, ids, abort);
-            if (extractor.is_empty()) return;
-            album_art_data_ptr blob;
-            try {
-                blob = extractor->query(album_art_ids::cover_front, abort);
-            } catch (...) {
-                return;
+            if (!extractor.is_empty()) {
+                album_art_data_ptr blob;
+                try {
+                    blob = extractor->query(album_art_ids::cover_front, abort);
+                } catch (...) {
+                    /* No embedded/local cover; provider fallback below. */
+                }
+                if (!blob.is_empty()) {
+                    HBITMAP bmp = decodeCoverBytes(blob->get_ptr(), blob->get_size());
+                    if (!bmp) {
+                        danmaku_log("[Danmaku] cover art decode failed");
+                    } else {
+                        localCoverApplied = apply_bitmap(
+                            bmp,
+                            "[Danmaku] local cover art applied to vinyl label");
+                    }
+                }
             }
-            if (blob.is_empty()) return;
 
-            HBITMAP bmp = decodeCoverBytes(blob->get_ptr(), blob->get_size());
+            if (localCoverApplied || cancelled() || !session ||
+                (g_engine && g_engine->hasCoverArt())) {
+                if (done) *done = true;
+                return;
+            }
+
+            /* Lazy provider fallback via the current track session. This reuses
+             * the same per-provider search metadata cache as comments. */
+            void* providerCover = nullptr;
+            int   providerSize  = 0;
+            int rc = music_client_track_fetch_cover(
+                session,
+                &providerCover,
+                &providerSize);
+            if (rc != MUSIC_OK || !providerCover || providerSize <= 0) {
+                if (rc != MUSIC_OK) {
+                    std::wstring err = L"[Danmaku] provider cover fetch skipped/failed rc="
+                                     + std::to_wstring(rc);
+                    danmaku_logW(err.c_str());
+                }
+                music_client_free(providerCover);
+                if (done) *done = true;
+                return;
+            }
+
+            HBITMAP bmp = decodeCoverBytes(providerCover, (size_t)providerSize);
+            music_client_free(providerCover);
             if (!bmp) {
-                danmaku_log("[Danmaku] cover art decode failed");
+                danmaku_log("[Danmaku] provider cover decode failed");
+                if (done) *done = true;
                 return;
             }
-            // If the track changed while we were fetching, drop this cover.
-            if (g_trackGen.load() != gen) {
-                DeleteObject(bmp);
-                return;
-            }
-            if (g_engine) {
-                g_engine->setCoverArt(bmp); // engine takes ownership
-                danmaku_log("[Danmaku] cover art applied to vinyl label");
-            } else {
-                DeleteObject(bmp);
-            }
+            apply_bitmap(bmp, "[Danmaku] provider cover applied to vinyl label");
         } catch (...) {
             danmaku_log("[Danmaku] cover art fetch threw");
         }
+        if (done) *done = true;
     }).detach();
 }
 
@@ -350,11 +413,10 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
     // Drop the previous album art immediately so we don't show stale cover
     // while the new one is being fetched.
     g_engine->setCoverArt(nullptr);
-    if (g_monitor) {
-        fetchAndApplyCoverArtAsync(g_monitor->getCurrentTrack(), gen);
-    }
+    metadb_handle_ptr currentTrack;
+    if (g_monitor) currentTrack = g_monitor->getCurrentTrack();
 
-    std::thread([targetHwnd, titleStr, artistStr, gen]() {
+    std::thread([targetHwnd, titleStr, artistStr, currentTrack, gen]() {
         const int  kInitialBurst   = 100;   // first batch — enough to start playing
         const int  kPageSize       = 50;    // incremental page size
         const int  kLowWaterMark   = 30;    // when poolRemaining ≤ this, prefetch
@@ -365,56 +427,49 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
             return g_trackGen.load() != gen;
         };
 
-        danmaku_log("[Danmaku] streaming worker: resolving song id\u2026");
+        danmaku_log("[Danmaku] streaming worker: opening track session\u2026");
 
-        // ── Step 1: resolve song id (and optionally cover art) ──────────
-        std::wstring kw = titleStr;
-        if (!artistStr.empty()) kw += L" " + artistStr;
-        wchar_t song_id[64] = {};
-        void*   cover_data  = nullptr;
-        int     cover_size  = 0;
-        /* Only ask for cover bytes if the engine has no art yet. */
-        const bool want_cover = g_engine && !g_engine->hasCoverArt();
-        int rc = music_client_search_song(
-            g_music, kw.c_str(),
-            song_id, 64,
-            want_cover ? &cover_data : nullptr,
-            want_cover ? &cover_size  : nullptr);
+        // ── Step 1: open a Layer-2 track session from raw metadata only ──
+        MusicTrackQuery query = {};
+        query.title = titleStr.c_str();
+        query.artist = artistStr.empty() ? nullptr : artistStr.c_str();
+        query.album = nullptr;
+        query.duration_ms = 0;
+
+        MusicTrackSessionHandle session = nullptr;
+        int rc = music_client_open_track_session(g_music, &query, &session);
         if (rc != MUSIC_OK) {
-            std::wstring err = L"[Danmaku] search_song FAILED rc="
+            std::wstring err = L"[Danmaku] open_track_session FAILED rc="
                              + std::to_wstring(rc)
                              + L" err=" + music_client_last_error(g_music);
             danmaku_logW(err.c_str());
-            music_client_free(cover_data);
             if (!cancelled()) g_fetching = false;
             return;
         }
-        if (cancelled()) { music_client_free(cover_data); return; }
+        if (cancelled()) {
+            music_client_close_track_session(session);
+            return;
+        }
 
-        /* Apply provider cover art if the engine still has none. */
-        if (cover_data) {
-            if (g_engine && !g_engine->hasCoverArt()) {
-                HBITMAP bmp = decodeCoverBytes(cover_data, (size_t)cover_size);
-                if (bmp) {
-                    g_engine->setCoverArt(bmp);
-                    danmaku_log("[Danmaku] provider cover applied");
-                    if (IsWindow(targetHwnd)) InvalidateRect(targetHwnd, nullptr, FALSE);
-                }
-            }
-            music_client_free(cover_data);
-            cover_data = nullptr;
+        auto coverDone = std::make_shared<std::atomic<bool>>(true);
+        if (!currentTrack.is_empty()) {
+            *coverDone = false;
+            fetchAndApplyCoverArtAsync(
+                currentTrack, gen, session, targetHwnd, coverDone);
         }
 
         // ── Step 2: fetch initial burst (one page of 100) so playback can start ──
         int delivered = 0;
-        rc = music_client_get_comments_paged(
-            g_music, song_id, 0, kInitialBurst,
+        rc = music_client_track_next_comments(
+            session, kInitialBurst,
             comment_cb, g_engine, &delivered);
         if (rc != MUSIC_OK) {
             std::wstring err = L"[Danmaku] initial page FAILED rc="
                              + std::to_wstring(rc)
                              + L" err=" + music_client_last_error(g_music);
             danmaku_logW(err.c_str());
+            for (int i = 0; i < 50 && !coverDone->load(); ++i) Sleep(10);
+            music_client_close_track_session(session);
             if (!cancelled()) g_fetching = false;
             return;
         }
@@ -431,7 +486,6 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
         // Stop only when the server delivers 0 — providers may cap per-page
         // items below kInitialBurst (e.g. QQ Music caps anonymous pages at 10).
         bool serverExhausted = (delivered == 0);
-        int  nextOffset      = delivered;
         int  pagesFetched    = 1;
 
         // ── Step 3: trickle more pages as the drip index approaches the end ──
@@ -449,12 +503,12 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
             if (cancelled()) break;
 
             delivered = 0;
-            rc = music_client_get_comments_paged(
-                g_music, song_id, nextOffset, kPageSize,
+            rc = music_client_track_next_comments(
+                session, kPageSize,
                 comment_cb, g_engine, &delivered);
             if (rc != MUSIC_OK) {
                 std::wstring err = L"[Danmaku] page@"
-                                 + std::to_wstring(nextOffset)
+                                 + std::to_wstring(pagesFetched + 1)
                                  + L" FAILED rc=" + std::to_wstring(rc)
                                  + L" err=" + music_client_last_error(g_music);
                 danmaku_logW(err.c_str());
@@ -465,12 +519,10 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
             }
 
             pagesFetched++;
-            nextOffset += delivered;
 
             {
                 std::wstring msg = L"[Danmaku] page#"
                                  + std::to_wstring(pagesFetched)
-                                 + L" offset=" + std::to_wstring(nextOffset - delivered)
                                  + L" got=" + std::to_wstring(delivered)
                                  + L" poolSize=" + std::to_wstring(g_engine->poolSize());
                 danmaku_logW(msg.c_str());
@@ -483,6 +535,8 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
             }
         }
 
+        for (int i = 0; i < 50 && !coverDone->load(); ++i) Sleep(10);
+        music_client_close_track_session(session);
         if (!cancelled()) g_fetching = false;
     }).detach();
 }

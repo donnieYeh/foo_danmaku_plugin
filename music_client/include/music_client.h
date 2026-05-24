@@ -14,15 +14,11 @@
  *   music_client_load_provider(h, L"C:\\...\\netease_client.dll", NULL);
  *   music_client_set_log(h, my_log_fn, NULL);
  *
- *   wchar_t song_id[64], cover_url[1024];
- *   music_client_search_song(h, L"晴天 周杰伦", song_id, 64, cover_url, 1024);
- *
- *   music_client_get_comments_paged(h, song_id, 0, 100, cb, userdata, &n);
- *
- *   void* img; int img_sz;
- *   music_client_download_bytes(h, cover_url, &img, &img_sz);
- *   // … decode img with GDI+ …
- *   music_client_free(img);
+ *   MusicTrackQuery q = { L"晴天", L"周杰伦", NULL, 0 };
+ *   MusicTrackSessionHandle s = NULL;
+ *   music_client_open_track_session(h, &q, &s);
+ *   music_client_track_next_comments(s, 100, cb, userdata, &n);
+ *   music_client_close_track_session(s);
  *
  *   music_client_destroy(h);
  */
@@ -45,6 +41,17 @@ extern "C" {
 
 /* ── opaque handle ───────────────────────────────────── */
 typedef void* MusicClientHandle;
+typedef void* MusicTrackSessionHandle;
+
+/** Raw metadata for one currently-playing track.
+ *  Layer 1 provides only this platform-neutral information; Layer 2 resolves
+ *  and caches provider-specific song IDs for the lifetime of a track session. */
+typedef struct MusicTrackQuery {
+    const wchar_t* title;       /* required */
+    const wchar_t* artist;      /* optional */
+    const wchar_t* album;       /* optional */
+    int            duration_ms; /* optional; 0 if unknown */
+} MusicTrackQuery;
 
 /* ── callbacks ───────────────────────────────────────── */
 
@@ -106,6 +113,48 @@ int music_client_reorder_providers(
     const int*        new_order,
     int               count);
 
+/* ── track session ───────────────────────────────────── */
+
+/** Open an ephemeral Layer-2 session for one currently-playing track.
+ *
+ *  The session copies @p query and maintains non-persistent mappings from the
+ *  track's raw metadata to provider-specific song IDs.  Close it when playback
+ *  moves to another track.
+ */
+int music_client_open_track_session(
+    MusicClientHandle        h,
+    const MusicTrackQuery*   query,
+    MusicTrackSessionHandle* out_session);
+
+/** Release a track session and its in-memory provider mappings. */
+void music_client_close_track_session(MusicTrackSessionHandle session);
+
+/** Fetch the next page of comments for a track session.
+ *
+ *  Layer 1 does not pass song IDs or offsets.  Layer 2 resolves provider IDs,
+ *  caches them in the session, advances offsets internally, and can fall back
+ *  to another provider if the initial provider cannot deliver the first page.
+ *
+ *  End-of-stream: MUSIC_OK with *out_delivered == 0.
+ */
+int music_client_track_next_comments(
+    MusicTrackSessionHandle     session,
+    int                         page_limit,
+    MusicClientCommentCallback  callback,
+    void*                       userdata,
+    int*                        out_delivered);
+
+/** Fetch cover art for a track session.
+ *
+ *  Reuses the same per-track provider resolution cache as comments.  If a
+ *  provider was already resolved for comments, this does not issue another
+ *  provider search just to discover its cover URL.
+ */
+int music_client_track_fetch_cover(
+    MusicTrackSessionHandle session,
+    void**                  out_data,
+    int*                    out_size);
+
 /* ── search ──────────────────────────────────────────── */
 
 /** Search for a song and return its platform ID.
@@ -143,22 +192,38 @@ int music_client_get_comments_paged(
     void*                        userdata,
     int*                         out_delivered);
 
-/* ── cover download ──────────────────────────────────── */
+/* ── cover fetch ─────────────────────────────────────── */
 
-/** Download raw image bytes from a URL (e.g., a cover-art URL returned by
- *  music_client_search_song).
+/** Atomically fetch cover art for a song keyword.
+ *
+ *  This is the cover-only variant of music_client_search_song(): callers pass
+ *  a music keyword and receive raw image bytes.  The intermediate provider
+ *  metadata and CDN URL are an implementation detail and are never exposed as
+ *  part of the public contract.
  *
  *  On success *out_data is a heap-allocated buffer of *out_size bytes.
  *  The caller must free it with music_client_free().
  *
- *  @return MUSIC_OK or MUSIC_ERR_NETWORK. */
+ *  @return MUSIC_OK, MUSIC_ERR_NOTFOUND, or another MUSIC_ERR_* code. */
+int  music_client_fetch_cover(
+    MusicClientHandle h,
+    const wchar_t*    keyword,
+    void**            out_data,
+    int*              out_size);
+
+/** Low-level byte downloader.
+ *
+ *  Deprecated for cover-art use: prefer music_client_fetch_cover() or the
+ *  out_cover_data parameter of music_client_search_song(), both of which make
+ *  cover fetching an atomic operation from the caller's point of view.
+ */
 int  music_client_download_bytes(
     MusicClientHandle h,
     const wchar_t*    url,
     void**            out_data,
     int*              out_size);
 
-/** Free a buffer returned by music_client_download_bytes(). */
+/** Free a buffer returned by music_client_search_song()/music_client_fetch_cover(). */
 void music_client_free(void* ptr);
 
 /* ── diagnostics ─────────────────────────────────────── */

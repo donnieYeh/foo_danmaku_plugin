@@ -3,7 +3,7 @@
  * Responsibilities:
  *   - Load / unload provider DLLs at runtime (LoadLibraryW / GetProcAddress)
  *   - Dispatch search + comment calls to the active provider
- *   - Own the cover-art HTTP download (URLOpenBlockingStreamW)
+ *   - Own atomic cover-art fetching (provider metadata lookup + HTTP download)
  *   - Forward log messages from providers to the caller's log sink
  */
 
@@ -45,10 +45,91 @@ struct MusicClientCtx {
     void log(const std::wstring& msg) const { log(msg.c_str()); }
 };
 
+struct TrackProviderState {
+    bool         tried_resolve    = false;
+    bool         resolved         = false;
+    bool         comments_failed  = false;
+    bool         cover_failed     = false;
+    std::wstring song_id;
+    std::wstring cover_url;
+    int          comment_offset   = 0;
+    int          delivered_total  = 0;
+};
+
+struct TrackSessionCtx {
+    MusicClientCtx*                  client = nullptr;
+    std::wstring                     title;
+    std::wstring                     artist;
+    std::wstring                     album;
+    int                              duration_ms = 0;
+    std::wstring                     keyword;
+    std::vector<TrackProviderState>  provider_states;
+    int                              active_comment_provider = -1;
+};
+
 /* ── helpers ─────────────────────────────────────────── */
 
 static MusicClientCtx* ctx(MusicClientHandle h) {
     return reinterpret_cast<MusicClientCtx*>(h);
+}
+
+static TrackSessionCtx* session_ctx(MusicTrackSessionHandle s) {
+    return reinterpret_cast<TrackSessionCtx*>(s);
+}
+
+static std::wstring build_keyword(const std::wstring& title,
+                                  const std::wstring& artist)
+{
+    std::wstring kw = title;
+    if (!artist.empty()) {
+        if (!kw.empty()) kw += L" ";
+        kw += artist;
+    }
+    return kw;
+}
+
+static int resolve_provider_for_session(
+    TrackSessionCtx* sess,
+    int              provider_idx)
+{
+    if (!sess || !sess->client) return MUSIC_ERR_PARAM;
+    MusicClientCtx* c = sess->client;
+    if (provider_idx < 0 || provider_idx >= (int)c->providers.size())
+        return MUSIC_ERR_PARAM;
+
+    TrackProviderState& st = sess->provider_states[provider_idx];
+    if (st.resolved) return MUSIC_OK;
+    if (st.tried_resolve) return MUSIC_ERR_NOTFOUND;
+    st.tried_resolve = true;
+
+    ProviderSlot& p = c->providers[provider_idx];
+    wchar_t song_id[128] = {};
+    wchar_t cover_url[2048] = {};
+    int rc = p.vtable->search_song(
+        p.handle,
+        sess->keyword.c_str(),
+        song_id, (int)_countof(song_id),
+        cover_url, (int)_countof(cover_url));
+
+    if (rc != MUSIC_OK) {
+        c->last_error = p.vtable->last_error(p.handle);
+        c->log(std::wstring(L"[music_client] provider[") + p.path
+               + L"] track resolve failed (rc=" + std::to_wstring(rc)
+               + L"), trying next");
+        return rc;
+    }
+
+    st.song_id = song_id;
+    st.cover_url = cover_url;
+    st.resolved = !st.song_id.empty();
+    if (!st.resolved) {
+        c->last_error = L"Provider resolved empty song id";
+        return MUSIC_ERR_NOTFOUND;
+    }
+
+    c->log(std::wstring(L"[music_client] track resolved by provider[")
+           + p.path + L"]");
+    return MUSIC_OK;
 }
 
 /* Trampoline: provider calls __stdcall MusicLogCallback;
@@ -58,6 +139,15 @@ static void __stdcall provider_log_trampoline(const wchar_t* msg, void* ud) {
     const MusicClientCtx* c = reinterpret_cast<const MusicClientCtx*>(ud);
     if (c) c->log(msg);
 }
+
+/* Internal URL downloader used only to complete Layer-2 atomic cover fetches.
+ * The public music_client_download_bytes() wrapper remains for compatibility,
+ * but cover-related code paths should call this helper instead. */
+static int download_bytes_from_url(
+    MusicClientCtx* c,
+    const wchar_t*  url,
+    void**          out_data,
+    int*            out_size);
 
 /* ── lifecycle ───────────────────────────────────────── */
 
@@ -178,7 +268,7 @@ int music_client_search_song(
             c->search_provider_idx = i;
             /* Download cover art if the provider returned a URL */
             if (want_cover && cover_url[0]) {
-                music_client_download_bytes(h, cover_url, out_cover_data, out_cover_size);
+                download_bytes_from_url(c, cover_url, out_cover_data, out_cover_size);
                 /* Non-fatal: song_id is valid even if cover download fails */
             }
             return MUSIC_OK;
@@ -238,6 +328,198 @@ int music_client_get_comments_paged(
     return rc;
 }
 
+/* ── track session ───────────────────────────────────── */
+
+int music_client_open_track_session(
+    MusicClientHandle        h,
+    const MusicTrackQuery*   query,
+    MusicTrackSessionHandle* out_session)
+{
+    if (out_session) *out_session = nullptr;
+    if (!h || !query || !query->title || !*query->title || !out_session)
+        return MUSIC_ERR_PARAM;
+
+    MusicClientCtx* c = ctx(h);
+    if (c->providers.empty()) {
+        c->last_error = L"No provider loaded";
+        return MUSIC_ERR_NO_PROVIDER;
+    }
+
+    TrackSessionCtx* s = new (std::nothrow) TrackSessionCtx();
+    if (!s) {
+        c->last_error = L"Out of memory creating track session";
+        return MUSIC_ERR_INTERNAL;
+    }
+
+    s->client      = c;
+    s->title       = query->title  ? query->title  : L"";
+    s->artist      = query->artist ? query->artist : L"";
+    s->album       = query->album  ? query->album  : L"";
+    s->duration_ms = query->duration_ms;
+    s->keyword     = build_keyword(s->title, s->artist);
+    s->provider_states.resize(c->providers.size());
+
+    *out_session = s;
+    c->log(std::wstring(L"[music_client] track session opened: ") + s->keyword);
+    return MUSIC_OK;
+}
+
+void music_client_close_track_session(MusicTrackSessionHandle session) {
+    delete session_ctx(session);
+}
+
+int music_client_track_next_comments(
+    MusicTrackSessionHandle     session,
+    int                         page_limit,
+    MusicClientCommentCallback  callback,
+    void*                       userdata,
+    int*                        out_delivered)
+{
+    if (out_delivered) *out_delivered = 0;
+    if (!session || page_limit <= 0 || !callback) return MUSIC_ERR_PARAM;
+
+    TrackSessionCtx* sess = session_ctx(session);
+    MusicClientCtx* c = sess->client;
+    if (!c || c->providers.empty()) return MUSIC_ERR_NO_PROVIDER;
+
+    int last_rc = MUSIC_ERR_NO_PROVIDER;
+    const int active = sess->active_comment_provider;
+    const bool can_retry_active =
+        (active >= 0 && active < (int)c->providers.size() &&
+         !sess->provider_states[active].comments_failed);
+
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < (int)c->providers.size(); i++) {
+            int provider_idx = -1;
+            if (pass == 0) {
+                if (!can_retry_active || i > 0) break;
+                provider_idx = active;
+            } else {
+                if (i == active) continue;
+                provider_idx = i;
+            }
+
+            TrackProviderState& st = sess->provider_states[provider_idx];
+            if (st.comments_failed) continue;
+
+            int rc = resolve_provider_for_session(sess, provider_idx);
+            if (rc != MUSIC_OK) {
+                last_rc = rc;
+                continue;
+            }
+
+            ProviderSlot& p = c->providers[provider_idx];
+            int delivered = 0;
+            rc = p.vtable->get_comments_paged(
+                p.handle,
+                st.song_id.c_str(),
+                st.comment_offset,
+                page_limit,
+                reinterpret_cast<MusicCommentCallback>(callback),
+                userdata,
+                &delivered);
+
+            if (out_delivered) *out_delivered = delivered;
+
+            if (rc == MUSIC_OK) {
+                sess->active_comment_provider = provider_idx;
+                c->search_provider_idx = provider_idx;
+                st.comment_offset += delivered;
+                st.delivered_total += delivered;
+                return MUSIC_OK;
+            }
+
+            c->last_error = p.vtable->last_error(p.handle);
+            c->log(std::wstring(L"[music_client] provider[") + p.path
+                   + L"] track comments failed (rc=" + std::to_wstring(rc)
+                   + L")");
+            last_rc = rc;
+
+            /* Cross-provider fallback is safe before any comments have been
+             * delivered.  Once a provider's stream has started, do not mix
+             * another platform's comment set into the same track session. */
+            if (st.delivered_total > 0 || st.comment_offset > 0) {
+                return rc;
+            }
+
+            st.comments_failed = true;
+            if (out_delivered) *out_delivered = 0;
+        }
+    }
+
+    return last_rc;
+}
+
+int music_client_track_fetch_cover(
+    MusicTrackSessionHandle session,
+    void**                  out_data,
+    int*                    out_size)
+{
+    if (out_data) *out_data = nullptr;
+    if (out_size) *out_size = 0;
+    if (!session || !out_data || !out_size) return MUSIC_ERR_PARAM;
+
+    TrackSessionCtx* sess = session_ctx(session);
+    MusicClientCtx* c = sess->client;
+    if (!c || c->providers.empty()) return MUSIC_ERR_NO_PROVIDER;
+
+    int last_rc = MUSIC_ERR_NO_PROVIDER;
+    const int active = sess->active_comment_provider;
+
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < (int)c->providers.size(); i++) {
+            int provider_idx = -1;
+            if (pass == 0) {
+                if (active < 0 || active >= (int)c->providers.size() || i > 0)
+                    break;
+                provider_idx = active;
+            } else {
+                if (i == active) continue;
+                provider_idx = i;
+            }
+
+            TrackProviderState& st = sess->provider_states[provider_idx];
+            if (st.cover_failed) continue;
+
+            int rc = resolve_provider_for_session(sess, provider_idx);
+            if (rc != MUSIC_OK) {
+                last_rc = rc;
+                continue;
+            }
+
+            if (st.cover_url.empty()) {
+                c->last_error = L"Provider returned no cover URL";
+                c->log(std::wstring(L"[music_client] provider[")
+                       + c->providers[provider_idx].path
+                       + L"] session cover URL empty, trying next");
+                st.cover_failed = true;
+                last_rc = MUSIC_ERR_NOTFOUND;
+                continue;
+            }
+
+            rc = download_bytes_from_url(c, st.cover_url.c_str(), out_data, out_size);
+            if (rc == MUSIC_OK && *out_data && *out_size > 0) {
+                c->search_provider_idx = provider_idx;
+                return MUSIC_OK;
+            }
+
+            c->log(std::wstring(L"[music_client] provider[")
+                   + c->providers[provider_idx].path
+                   + L"] session cover download failed (rc="
+                   + std::to_wstring(rc) + L"), trying next");
+            music_client_free(*out_data);
+            *out_data = nullptr;
+            *out_size = 0;
+            st.cover_failed = true;
+            last_rc = rc;
+        }
+    }
+
+    if (c->last_error.empty())
+        c->last_error = L"No provider could fetch cover art for track session";
+    return last_rc;
+}
+
 /* ── provider introspection ──────────────────────────────── */
 
 int music_client_get_provider_count(MusicClientHandle h) {
@@ -274,19 +556,87 @@ int music_client_reorder_providers(
     return MUSIC_OK;
 }
 
-/* ── cover download ──────────────────────────────────── */
+/* ── cover fetch / download ──────────────────────────── */
 
-int music_client_download_bytes(
+int music_client_fetch_cover(
     MusicClientHandle h,
-    const wchar_t*    url,
+    const wchar_t*    keyword,
     void**            out_data,
     int*              out_size)
 {
-    if (!h || !url || !*url || !out_data || !out_size) return MUSIC_ERR_PARAM;
-    *out_data = nullptr;
-    *out_size = 0;
+    if (out_data) *out_data = nullptr;
+    if (out_size) *out_size = 0;
+    if (!h || !keyword || !out_data || !out_size) return MUSIC_ERR_PARAM;
 
     MusicClientCtx* c = ctx(h);
+    if (c->providers.empty()) {
+        c->last_error = L"No provider loaded";
+        return MUSIC_ERR_NO_PROVIDER;
+    }
+
+    /* Cover-only operation: unlike music_client_search_song(), a provider is
+     * considered successful only if it produces downloadable, non-empty image
+     * bytes.  If QQ Music resolves the song but its CDN cover URL fails, keep
+     * trying the next provider (e.g. NetEase) instead of returning MUSIC_OK
+     * with a null cover. */
+    int last_rc = MUSIC_ERR_NO_PROVIDER;
+    for (int i = 0; i < (int)c->providers.size(); i++) {
+        ProviderSlot& s = c->providers[i];
+        wchar_t ignored_song_id[128] = {};
+        wchar_t cover_url[2048]      = {};
+
+        int rc = s.vtable->search_song(
+            s.handle,
+            keyword,
+            ignored_song_id, (int)_countof(ignored_song_id),
+            cover_url,      (int)_countof(cover_url));
+
+        if (rc != MUSIC_OK) {
+            c->last_error = s.vtable->last_error(s.handle);
+            c->log(std::wstring(L"[music_client] provider[") + s.path
+                   + L"] cover metadata failed (rc=" + std::to_wstring(rc)
+                   + L"), trying next");
+            last_rc = rc;
+            continue;
+        }
+
+        if (!cover_url[0]) {
+            c->last_error = L"Provider returned no cover URL";
+            c->log(std::wstring(L"[music_client] provider[") + s.path
+                   + L"] returned no cover URL, trying next");
+            last_rc = MUSIC_ERR_NOTFOUND;
+            continue;
+        }
+
+        rc = download_bytes_from_url(c, cover_url, out_data, out_size);
+        if (rc == MUSIC_OK && *out_data && *out_size > 0) {
+            c->search_provider_idx = i;
+            return MUSIC_OK;
+        }
+
+        c->log(std::wstring(L"[music_client] provider[") + s.path
+               + L"] cover download failed (rc=" + std::to_wstring(rc)
+               + L"), trying next");
+        music_client_free(*out_data);
+        *out_data = nullptr;
+        *out_size = 0;
+        last_rc = rc;
+    }
+
+    if (c->last_error.empty())
+        c->last_error = L"No provider could fetch cover art";
+    return last_rc;
+}
+
+static int download_bytes_from_url(
+    MusicClientCtx* c,
+    const wchar_t*  url,
+    void**          out_data,
+    int*            out_size)
+{
+    if (!c || !url || !*url || !out_data || !out_size) return MUSIC_ERR_PARAM;
+    *out_data = nullptr;
+    *out_size = 0;
 
     IStream* stream = nullptr;
     HRESULT hr = URLOpenBlockingStreamW(nullptr, url, &stream, 0, nullptr);
@@ -322,6 +672,16 @@ int music_client_download_bytes(
     *out_data = data;
     *out_size = static_cast<int>(buf.size());
     return MUSIC_OK;
+}
+
+int music_client_download_bytes(
+    MusicClientHandle h,
+    const wchar_t*    url,
+    void**            out_data,
+    int*              out_size)
+{
+    if (!h) return MUSIC_ERR_PARAM;
+    return download_bytes_from_url(ctx(h), url, out_data, out_size);
 }
 
 void music_client_free(void* ptr) {
