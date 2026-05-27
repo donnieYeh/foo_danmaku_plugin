@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 #include <cstdlib>
+#include <chrono>
 
 /* Pull in urlmon at link time (propagates to the consuming DLL via .obj). */
 #pragma comment(lib, "urlmon.lib")
@@ -639,7 +640,14 @@ static int download_bytes_from_url(
     *out_size = 0;
 
     IStream* stream = nullptr;
+    auto started = std::chrono::steady_clock::now();
     HRESULT hr = URLOpenBlockingStreamW(nullptr, url, &stream, 0, nullptr);
+    auto opened = std::chrono::steady_clock::now();
+    auto open_ms = std::chrono::duration_cast<std::chrono::milliseconds>(opened - started).count();
+    if (open_ms >= 30000) {
+        c->log(std::wstring(L"[music_client] cover open took ")
+               + std::to_wstring(open_ms) + L"ms (>=30000ms): " + url);
+    }
     if (FAILED(hr) || !stream) {
         c->last_error = L"URLOpenBlockingStreamW failed for cover URL";
         c->log(c->last_error);
@@ -654,6 +662,12 @@ static int download_bytes_from_url(
         if (read > 0) buf.insert(buf.end(), block, block + read);
         if (FAILED(hr) || read == 0) break;
         if (buf.size() > 20u * 1024 * 1024) break; /* 20 MB sanity cap */
+    }
+    auto finished = std::chrono::steady_clock::now();
+    auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(finished - started).count();
+    if (total_ms >= 30000) {
+        c->log(std::wstring(L"[music_client] cover download took ")
+               + std::to_wstring(total_ms) + L"ms (>=30000ms): " + url);
     }
     stream->Release();
 

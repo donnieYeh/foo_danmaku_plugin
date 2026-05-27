@@ -63,10 +63,17 @@ private:
     HttpClient& m_http;
 
     /* Build encrypted POST body and send to /weapi/<path>.
-     * Returns raw JSON response string, or "" on failure. */
-    std::string weapi(const std::wstring& path,
-                      const std::string&  payload_json,
-                      std::wstring&       error_msg);
+     * Returns NETEASE_OK and fills out_resp on success. */
+    int weapi(const std::wstring& path,
+              const std::string&  payload_json,
+              std::string&        out_resp,
+              std::wstring&       error_msg);
+
+    int fetch_comments_page(const std::wstring& song_id,
+                            int                 offset,
+                            int                 page_size,
+                            std::string&        out_resp,
+                            std::wstring&       error_msg);
 };
 
 } // namespace netease

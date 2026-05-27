@@ -7,6 +7,27 @@
 namespace netease {
 namespace json {
 
+std::string escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        if      (c == '"')  out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else if (c < 0x20) {
+            static const char kHex[] = "0123456789ABCDEF";
+            out += "\\u00";
+            out += kHex[c >> 4];
+            out += kHex[c & 0x0F];
+        } else {
+            out += (char)c;
+        }
+    }
+    return out;
+}
+
 /* ── internal: unescape a raw JSON string value ─────── */
 
 static std::string unescape(const char* p, const char* end) {

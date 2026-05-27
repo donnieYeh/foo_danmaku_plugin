@@ -28,5 +28,8 @@ std::wstring to_wide(const std::string& utf8);
 /** UTF-16 → UTF-8 */
 std::string to_utf8(const std::wstring& wide);
 
+/** Escape a UTF-8 string for use inside a JSON string literal. */
+std::string escape(const std::string& s);
+
 } // namespace json
 } // namespace netease

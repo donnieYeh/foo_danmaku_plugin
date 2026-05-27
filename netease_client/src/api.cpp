@@ -1,9 +1,11 @@
 /* api.cpp — NetEase Cloud Music search + comments
  *
- * Uses weapi encrypted endpoints (encrypt_weapi from crypto.cpp).
- * The old unencrypted /api/ paths have been deprecated and now return HTTP 500.
+ * Search currently uses the legacy unencrypted /api/search/get/web endpoint.
+ * The encrypted /weapi/cloudsearch/get/web endpoint can return code 50000005
+ * for anonymous requests, so keep it out of the primary resolve path.
+ * Comments still use weapi encrypted endpoints (encrypt_weapi from crypto.cpp).
  *
- *   Search  : POST https://music.163.com/weapi/cloudsearch/get/web
+ *   Search  : POST https://music.163.com/api/search/get/web
  *             payload: {"s":"<kw>","type":1,"limit":20,"offset":0,
  *                       "total":true,"csrf_token":""}
  *
@@ -24,22 +26,6 @@
 namespace netease {
 
 ApiClient::ApiClient(HttpClient& http) : m_http(http) {}
-
-/* ── JSON string escape (for building payload inline) ── */
-
-static std::string json_escape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (unsigned char c : s) {
-        if      (c == '"')  out += "\\\"";
-        else if (c == '\\') out += "\\\\";
-        else if (c == '\n') out += "\\n";
-        else if (c == '\r') out += "\\r";
-        else if (c == '\t') out += "\\t";
-        else                 out += (char)c;
-    }
-    return out;
-}
 
 /* ── percent-encode a UTF-8 string for form POST body ── */
 
@@ -95,6 +81,42 @@ static std::string api_call(
     return resp;
 }
 
+static long long num_last(const std::string& js, const std::string& key, long long def) {
+    std::string pat = "\"" + key + "\":";
+    size_t pos = js.rfind(pat);
+    if (pos == std::string::npos) return def;
+    const char* p = js.c_str() + pos + pat.size();
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '"') ++p; /* handle quoted numbers */
+    if (!(*p == '-' || (*p >= '0' && *p <= '9'))) return def;
+    char* endp = nullptr;
+    long long v = strtoll(p, &endp, 10);
+    return (endp > p) ? v : def;
+}
+
+int ApiClient::weapi(
+    const std::wstring& path,
+    const std::string&  payload_json,
+    std::string&        out_resp,
+    std::wstring&       error_msg)
+{
+    out_resp.clear();
+    std::string params, enc_sec_key;
+    if (!encrypt_weapi(payload_json, params, enc_sec_key, error_msg)) {
+        log(L"weapi: encrypt failed: " + error_msg);
+        return NETEASE_ERR_CRYPTO;
+    }
+
+    std::string body = "params=" + params + "&encSecKey=" + enc_sec_key;
+    std::string raw;
+    if (!m_http.post(path, body, raw, error_msg)) {
+        log(L"weapi HTTP failed: " + error_msg);
+        return NETEASE_ERR_NETWORK;
+    }
+    out_resp = api_call(raw, error_msg);
+    return out_resp.empty() ? NETEASE_ERR_API : NETEASE_OK;
+}
+
 /* ── search_song ─────────────────────────────────────── */
 
 std::wstring ApiClient::search_song(
@@ -113,27 +135,19 @@ SongInfo ApiClient::search_song_info(
     std::string kw_utf8 = json::to_utf8(keyword);
     loga("search_song keyword: " + kw_utf8);
 
-    /* POST /weapi/cloudsearch/get/web  — weapi encrypted */
-    std::string json_payload =
-        "{\"s\":\""    + json_escape(kw_utf8) + "\","
-        "\"type\":1,"
-        "\"limit\":20,"
-        "\"offset\":0,"
-        "\"total\":true,"
-        "\"csrf_token\":\"\"}";
+    std::string resp;
+    std::string body =
+        "s="      + url_encode_utf8(kw_utf8) +
+        "&type=1"
+        "&limit=20"
+        "&offset=0"
+        "&total=true";
 
-    std::string params, enc_sec_key;
-    if (!encrypt_weapi(json_payload, params, enc_sec_key, error_msg)) {
-        log(L"search_song: weapi encrypt failed: " + error_msg);
+    if (!m_http.post(L"/api/search/get/web", body, resp, error_msg)) {
+        log(L"search_song HTTP failed: " + error_msg);
         return info;
     }
-    std::string body = "params=" + params + "&encSecKey=" + enc_sec_key;
-
-    std::string raw;
-    if (!m_http.post(L"/weapi/cloudsearch/get/web", body, raw, error_msg))
-        return info;
-
-    std::string resp = api_call(raw, error_msg);
+    resp = api_call(resp, error_msg);
     if (resp.empty()) return info;
 
     /* Parse result.songs[0].id */
@@ -150,7 +164,10 @@ SongInfo ApiClient::search_song_info(
         return info;
     }
 
-    long long id = json::num(songs[0], "id", 0);
+    /* The legacy /api/search/get/web song object contains nested album/artist
+     * objects before the song's own id.  json::num() returns the FIRST "id",
+     * which can be album.artist.id == 0, so read the last id in this item. */
+    long long id = num_last(songs[0], "id", 0);
     if (id == 0) {
         error_msg = L"Failed to parse song ID";
         log(L"songs[0]=" + json::to_wide(songs[0].substr(0, 80)));
@@ -159,11 +176,16 @@ SongInfo ApiClient::search_song_info(
     log(L"search_song: found id=" + std::to_wstring(id));
     info.id = std::to_wstring(id);
 
-    /* /weapi/cloudsearch/get/web: cover is at songs[0].al.picUrl
-     * Keep songs[0].picUrl as fallback for forward compat. */
-    std::string al_blk = json::object_raw(songs[0], "al");
-    if (!al_blk.empty())
-        info.cover_url = json::to_wide(json::str(al_blk, "picUrl"));
+    /* /api/search/get/web: cover is usually at songs[0].album.picUrl.
+     * Keep songs[0].al.picUrl and songs[0].picUrl as fallbacks for forward compat. */
+    std::string album_blk = json::object_raw(songs[0], "album");
+    if (!album_blk.empty())
+        info.cover_url = json::to_wide(json::str(album_blk, "picUrl"));
+    if (info.cover_url.empty()) {
+        std::string al_blk = json::object_raw(songs[0], "al");
+        if (!al_blk.empty())
+            info.cover_url = json::to_wide(json::str(al_blk, "picUrl"));
+    }
     if (info.cover_url.empty())
         info.cover_url = json::to_wide(json::str(songs[0], "picUrl"));
     if (!info.cover_url.empty()) {
@@ -196,6 +218,29 @@ static int parse_comment_list(
     return 0;
 }
 
+int ApiClient::fetch_comments_page(
+    const std::wstring& song_id,
+    int                 offset,
+    int                 page_size,
+    std::string&        out_resp,
+    std::wstring&       error_msg)
+{
+    std::string id_utf8 = json::to_utf8(song_id);
+    std::string thread_id = "R_SO_4_" + id_utf8;
+    std::string jp =
+        "{\"rid\":\""    + json::escape(thread_id)       + "\","
+        "\"limit\":"    + std::to_string(page_size)      + ","
+        "\"offset\":"   + std::to_string(offset)         + ","
+        "\"total\":true,"
+        "\"csrf_token\":\"\"}";
+    std::wstring path = L"/weapi/v1/resource/comments/R_SO_4_" + song_id;
+
+    loga("fetch_comments_page offset=" + std::to_string(offset)
+       + " limit=" + std::to_string(page_size));
+
+    return weapi(path, jp, out_resp, error_msg);
+}
+
 /* ── get_comments ────────────────────────────────────── */
 
 int ApiClient::get_comments(
@@ -204,7 +249,6 @@ int ApiClient::get_comments(
     CommentVisitor      visitor,
     std::wstring&       error_msg)
 {
-    std::string id_utf8 = json::to_utf8(song_id);
     int fetched = 0;
     int offset  = 0;
     const int page_size = std::min(limit, 100);
@@ -213,31 +257,9 @@ int ApiClient::get_comments(
     bool first_page = true;
 
     while (fetched < limit) {
-        /* POST /weapi/v1/resource/comments/R_SO_4_{id} — weapi encrypted */
-        std::string thread_id = "R_SO_4_" + id_utf8;
-        std::string jp =
-            "{\"rid\":\""    + thread_id             + "\","
-            "\"limit\":"    + std::to_string(page_size) + ","
-            "\"offset\":"   + std::to_string(offset)    + ","
-            "\"total\":true,"
-            "\"csrf_token\":\"\"}";
-        std::string params, enc_sec_key;
-        if (!encrypt_weapi(jp, params, enc_sec_key, error_msg)) {
-            log(L"get_comments: weapi encrypt failed: " + error_msg);
-            return NETEASE_ERR_CRYPTO;
-        }
-        std::string body = "params=" + params + "&encSecKey=" + enc_sec_key;
-        std::wstring path = L"/weapi/v1/resource/comments/R_SO_4_" + song_id;
-
-        loga("get_comments offset=" + std::to_string(offset));
-        std::string raw;
-        if (!m_http.post(path, body, raw, error_msg)) {
-            log(L"get_comments HTTP failed: " + error_msg);
-            return NETEASE_ERR_NETWORK;
-        }
-
-        std::string resp = api_call(raw, error_msg);
-        if (resp.empty()) return NETEASE_ERR_API;
+        std::string resp;
+        int rc = fetch_comments_page(song_id, offset, page_size, resp, error_msg);
+        if (rc != NETEASE_OK) return rc;
 
         /* On first page, include hotComments first */
         if (first_page) {
@@ -285,35 +307,9 @@ int ApiClient::get_comments_page(
 {
     out_delivered = 0;
     int page_size = std::min(std::max(limit, 1), 100);
-    std::string id_utf8 = json::to_utf8(song_id);
-
-    /* POST /weapi/v1/resource/comments/R_SO_4_{id} — weapi encrypted */
-    std::string thread_id = "R_SO_4_" + id_utf8;
-    std::string jp =
-        "{\"rid\":\""    + thread_id             + "\","
-        "\"limit\":"    + std::to_string(page_size) + ","
-        "\"offset\":"   + std::to_string(offset)    + ","
-        "\"total\":true,"
-        "\"csrf_token\":\"\"}";
-    std::string params, enc_sec_key;
-    if (!encrypt_weapi(jp, params, enc_sec_key, error_msg)) {
-        log(L"get_comments_page: weapi encrypt failed: " + error_msg);
-        return NETEASE_ERR_CRYPTO;
-    }
-    std::string body = "params=" + params + "&encSecKey=" + enc_sec_key;
-    std::wstring path = L"/weapi/v1/resource/comments/R_SO_4_" + song_id;
-
-    loga("get_comments_page offset=" + std::to_string(offset)
-       + " limit=" + std::to_string(page_size));
-
-    std::string raw;
-    if (!m_http.post(path, body, raw, error_msg)) {
-        log(L"get_comments_page HTTP failed: " + error_msg);
-        return NETEASE_ERR_NETWORK;
-    }
-
-    std::string resp = api_call(raw, error_msg);
-    if (resp.empty()) return NETEASE_ERR_API;
+    std::string resp;
+    int rc = fetch_comments_page(song_id, offset, page_size, resp, error_msg);
+    if (rc != NETEASE_OK) return rc;
 
     int fetched = 0;
     // hotComments only attached to first page in NetEase API

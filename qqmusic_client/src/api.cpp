@@ -211,9 +211,11 @@ SongInfo ApiClient::search_song_info(
             + L"&tmeAppID=qqmusic&format=json&inCharset=utf-8&outCharset=utf-8"
             L"&notice=0&platform=yqq.json&needNewCode=0";
 
+        bool detail_ok = false;
         std::string detail_raw;
         std::wstring detail_err;
-        if (m_http.get(detail_path, detail_raw, detail_err)) {
+        detail_ok = m_http.get(detail_path, detail_raw, detail_err);
+        if (detail_ok) {
             /* response: {"code":0,"data":[{"album":{"mid":"..."},...},...]} */
             std::string darr = json::array_raw(detail_raw, "data");
             if (!darr.empty()) {
