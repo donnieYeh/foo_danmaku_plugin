@@ -1,8 +1,8 @@
 # netease_client — 设计文档
 
-> 版本：v1.0  
-> 日期：2026-05-22  
-> 状态：设计定稿，待实施
+> 版本：v1.1  
+> 日期：2026-05-27  
+> 状态：已实现（平文 /api/ 已封禁，切换到 weapi）
 
 ---
 
@@ -305,25 +305,31 @@ std::vector<std::string> json_get_array(const std::string& json, const std::stri
 
 ### 4.4 api.cpp — 业务逻辑
 
-移植自 `client.py`，实现：
+#### ⚠️ 端点变更说明（2026-05）
+
+网易云音乐明文 `/api/` 系列端点已封禁（HTTP 500），当前全面切换到 weapi 加密端点：
+
+| 功能 | 旧端点（已失效） | 当前端点 |
+|---|---|---|
+| 搜索 | `POST /api/cloudsearch/pc`（明文） | `POST /weapi/cloudsearch/get/web`（weapi 加密） |
+| 评论 | `GET /api/v1/resource/comments/R_SO_4_{id}`（明文） | `POST /weapi/v1/resource/comments/R_SO_4_{id}`（weapi 加密） |
 
 ```
 search_song(keyword)
     → POST /weapi/cloudsearch/get/web
-      payload: { s, type:1, limit:20, offset:0, csrf_token:"" }
+      payload（加密前）: {"s":"<kw>","type":1,"limit":20,"offset":0,
+                       "total":true,"csrf_token":""}
+    → encrypt_weapi(payload) → params + encSecKey
     → 解析 result.songs[0].id
-    → fallback: POST /weapi/search/get
+    → 封面： songs[0].al.picUrl（新）/ songs[0].picUrl（旧，备用）
 
-get_comments_page(thread_id, page_no, cursor, page_size)
-    → POST /weapi/v2/resource/comments
-      payload: { threadId, pageNo, pageSize, cursor, sortType:3, csrf_token:"" }
-    → 解析 data.comments[]
-
-iter_comments(song_id, limit, callback)
-    → thread_id = "R_SO_4_{song_id}"
-    → 循环调用 get_comments_page，游标翻页
-    → 每条 comment 调用 callback
-    → hasMore=false 或 fetched>=limit 时停止
+get_comments_page(song_id, offset, page_size)
+    → POST /weapi/v1/resource/comments/R_SO_4_{song_id}
+      payload（加密前）: {"rid":"R_SO_4_<id>","limit":<n>,"offset":<m>,
+                       "total":true,"csrf_token":""}
+    → encrypt_weapi(payload) → params + encSecKey
+    → 解析 hotComments[]（第 0 页）+ comments[]
+    → more=false 或 fetched>=limit 时停止
 ```
 
 #### 反速率限制策略

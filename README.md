@@ -19,8 +19,8 @@
 │          │ 客户端中枢：抽象接口、原子化封面拉取、DLL 派发 │
 │          │ 运行时 LoadLibraryW ↓                     │
 ├─────────────────────────────────────────────────────┤
-│  Layer 3 │ netease_client.dll（动态库）              │
-│          │ 平台实现：网易云音乐 weapi 加密 + HTTP    │
+│  Layer 3 │ netease_client.dll / qqmusic_client.dll   │
+│          │ 平台实现：weapi/HTTP，按需添加新平台      │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -53,13 +53,13 @@ Layer 3 通过统一的 `MusicProviderVTable`（C ABI vtable）接入，
 安装包 `foo_danmaku-x.x.x.fb2k-component`（标准 zip 改后缀）内部结构：
 
 ```
-x64/
-  foo_danmaku.dll       ← 插件主体（含 music_client 代码）
-  netease_client.dll    ← Layer 3 provider，与插件同目录
+foo_danmaku.dll         ← 插件主体（含 music_client 代码）
+netease_client.dll      ← Layer 3 provider：网易云音乐
+qqmusic_client.dll      ← Layer 3 provider：QQ 音乐（可选）
 ```
 
-foobar2000 安装时将 `x64/` 内容解压到 `components/`，
-两个 DLL 落在同一目录，满足 `LoadLibraryW` 的同目录查找。
+foobar2000 安装时将所有 DLL 解压到 `components/` 目录，
+落在同一目录，满足 `LoadLibraryW` 的同目录查找。
 
 ---
 
@@ -82,6 +82,15 @@ windsurf/
 │   │   └── provider_entry.cpp      # 适配 MusicProviderVTable
 │   ├── build.ps1
 │   └── DESIGN.md                   # 内部实现详解
+│
+├── qqmusic_client/                 # Layer 3 — QQ 音乐 provider
+│   ├── include/qqmusic_client.h
+│   ├── src/
+│   │   ├── api.cpp / http.cpp / json.cpp
+│   │   ├── qqmusic_client.cpp
+│   │   └── provider_entry.cpp
+│   ├── build.ps1
+│   └── DESIGN.md
 │
 └── foobar_comment_flow/            # Layer 1 — foobar2000 插件
     ├── foo_danmaku/
@@ -107,6 +116,7 @@ windsurf/
 
 # 2. 编译 Layer 3 provider DLL
 .\netease_client\build.ps1 -Platform x64
+.\qqmusic_client\build.ps1 -Platform x64
 
 # 3. 编译 Layer 1 插件 DLL
 .\foobar_comment_flow\foo_danmaku\build.ps1 -Platform x64

@@ -210,10 +210,10 @@ static BigInt1024 bi_mod2048(const BigInt2048& a, const BigInt1024& n) {
             }
         }
 
-        /* Compare r >= ns */
-        bool ge = false;
+        /* Compare r >= ns  (init true: if all words equal, r==ns → subtract) */
+        bool ge = true;
         for (int i = 63; i >= 0; --i) {
-            if (r.d[i] > ns.d[i]) { ge = true; break; }
+            if (r.d[i] > ns.d[i]) { ge = true;  break; }
             if (r.d[i] < ns.d[i]) { ge = false; break; }
         }
         if (ge) {
@@ -255,12 +255,14 @@ static std::string rsa_encrypt_sec_key(const std::string& sec_key /* 16 ASCII */
     /* Step 1: reverse sec_key bytes */
     std::string rev(sec_key.rbegin(), sec_key.rend());
 
-    /* Step 2: load as 1024-bit big-endian integer (zero-pad left) */
+    /* Step 2: load as big-endian integer.
+     * rev is 16 bytes: rev[0] is the MOST significant byte.
+     * Mirrors Python: int.from_bytes(rev, 'big')
+     * In the 1024-bit little-endian word array, rev[0] ends up in word 3 at
+     * bit 24 (the highest byte of word 3), rev[15] in word 0 at bit 0. */
     BigInt1024 m;
-    /* rev is 16 bytes; place at high end of 128-byte number */
     for (int i = 0; i < 16; ++i) {
-        /* byte index from MSB: i → stored at word/bit position */
-        int byte_pos = 127 - i; /* 0-based from LSB end */
+        int byte_pos = 15 - i; /* 0-based from LSB end; rev[0]=MSB → byte_pos=15 */
         int word = byte_pos / 4;
         int bit  = (byte_pos % 4) * 8;
         m.d[word] |= ((u32)(uint8_t)rev[i]) << bit;
@@ -351,7 +353,7 @@ bool encrypt_weapi(
             cipher2, error_msg))
         return false;
 
-    out_params = url_encode(base64_encode(cipher2.data(), cipher2.size()));
+    out_params      = url_encode(base64_encode(cipher2.data(), cipher2.size()));
 
     /* 4. RSA( reverse(sec_key) ) → hex */
     out_enc_sec_key = rsa_encrypt_sec_key(sec_key);

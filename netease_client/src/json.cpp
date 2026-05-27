@@ -90,6 +90,31 @@ long long num(const std::string& js, const std::string& key, long long def) {
     return (endp > found) ? v : def;
 }
 
+/* ── object_raw ──────────────────────────────────────── */
+
+std::string object_raw(const std::string& js, const std::string& key) {
+    std::string pat = "\"" + key + "\":{";
+    const char* p = js.c_str();
+    const char* found = strstr(p, pat.c_str());
+    if (!found) return "";
+    found += pat.size() - 1; /* position at '{' */
+    const char* start = found;
+    int depth = 0;
+    while (*found) {
+        if (*found == '{')       ++depth;
+        else if (*found == '}') { --depth; if (depth == 0) { ++found; break; } }
+        else if (*found == '"') {
+            ++found;
+            while (*found && *found != '"') {
+                if (*found == '\\') { ++found; if (*found) ++found; }
+                else ++found;
+            }
+        }
+        ++found;
+    }
+    return std::string(start, found);
+}
+
 /* ── array_raw ───────────────────────────────────────── */
 
 std::string array_raw(const std::string& js, const std::string& key) {

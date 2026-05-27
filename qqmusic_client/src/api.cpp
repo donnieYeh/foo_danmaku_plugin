@@ -107,7 +107,9 @@ static bool check_api_code(const std::string& resp,
 {
     if (resp.empty()) { error_msg = L"Empty response"; return false; }
     long long code = json::num(resp, "code", -1);
-    if (code != 0) {
+    /* QQ Music soso search API historically returned code:0 for success,
+     * but has since migrated to HTTP-style code:200.  Accept both. */
+    if (code != 0 && code != 200) {
         error_msg = L"QQ Music API error code=" + std::to_wstring(code);
         /* Try to get a message */
         std::string msg = json::str(resp, "message");
@@ -130,14 +132,14 @@ SongInfo ApiClient::search_song_info(
     std::string kw_encoded = url_encode_utf8(kw_utf8);
     loga("search_song keyword: " + kw_utf8);
 
-    /* Build path + query string (all pure ASCII after encoding) */
+    /* ── Step 1: search via smartbox_new (soso/client_search_cp is dead) ───── */
     std::wstring path =
-        L"/soso/fcgi-bin/client_search_cp"
-        L"?w="         + std::wstring(kw_encoded.begin(), kw_encoded.end()) +
-        L"&p=1&n=10"
+        L"/splcloud/fcgi-bin/smartbox_new.fcg"
+        L"?is_xml=0"
+        L"&key="    + std::wstring(kw_encoded.begin(), kw_encoded.end()) +
+        L"&g_tk=5381&loginUin=0&hostUin=0"
         L"&format=json&inCharset=utf-8&outCharset=utf-8"
-        L"&notice=0&platform=yqq.json&needNewCode=0"
-        L"&ct=24&cv=4747474";
+        L"&notice=0&platform=yqq.json&needNewCode=1";
 
     std::string raw;
     if (!m_http.get(path, raw, error_msg)) {
@@ -146,67 +148,94 @@ SongInfo ApiClient::search_song_info(
     }
     if (!check_api_code(raw, error_msg)) return info;
 
-    /* Navigate: data → song → list → [0] */
+    /* Navigate: data → song → itemlist → [0]
+     * smartbox response: {"code":0,"data":{"song":{"count":N,"itemlist":[...]},...}} */
     std::string data_blk = json::object_raw(raw, "data");
     if (data_blk.empty()) {
-        error_msg = L"search: missing 'data' in response";
+        error_msg = L"search: missing 'data' in smartbox response";
         log(error_msg);
         return info;
     }
 
     std::string song_blk = json::object_raw(data_blk, "song");
     if (song_blk.empty()) {
-        error_msg = L"search: missing 'song' in data";
+        error_msg = L"No songs found for: " + keyword;
         log(error_msg);
         return info;
     }
 
-    std::string list_raw = json::array_raw(song_blk, "list");
-    if (list_raw.empty()) {
-        error_msg = L"search: 'list' array missing or empty";
-        log(error_msg);
+    long long song_count = json::num(song_blk, "count", -1);
+    if (song_count == 0) {
+        error_msg = L"No songs found for: " + keyword;
+        loga("search_song: smartbox count=0");
         return info;
     }
 
+    std::string list_raw = json::array_raw(song_blk, "itemlist");
     auto songs = json::array_items(list_raw);
     if (songs.empty()) {
         error_msg = L"No songs found for: " + keyword;
-        loga("search_song: no items in list array");
+        loga("search_song: smartbox itemlist empty");
         return info;
     }
 
     const std::string& first = songs[0];
 
-    /* Extract numeric songid — this is used as topid in the comments API */
-    long long id_num = json::num(first, "songid", 0);
+    /* smartbox returns id as a JSON string ("id":"97773"), not a number.
+     * Try json::num first (handles both); fall back to str+stoll. */
+    long long id_num = json::num(first, "id", 0);
     if (id_num == 0) {
-        error_msg = L"Failed to parse numeric songid";
+        std::string id_str = json::str(first, "id");
+        if (!id_str.empty()) {
+            try { id_num = std::stoll(id_str); } catch (...) {}
+        }
+    }
+    if (id_num == 0) {
+        error_msg = L"Failed to parse numeric song id from smartbox";
         log(error_msg);
         return info;
     }
     info.id = std::to_wstring(id_num);
-    log(L"search_song: songid=" + info.id);
+    log(L"search_song: id=" + info.id);
 
-    /* Also extract alphanumeric songmid (for reference / caller info) */
-    std::string mid = json::str(first, "songmid");
-    info.mid = json::to_wide(mid);
+    std::string mid_str = json::str(first, "mid");
+    info.mid = json::to_wide(mid_str);
     if (!info.mid.empty())
-        log(L"search_song: songmid=" + info.mid);
+        log(L"search_song: mid=" + info.mid);
 
-    /* Extract albummid for cover URL */
-    std::string album_mid = json::str(first, "albummid");
-    if (album_mid.empty()) {
-        /* Try nested: "album":{"mid":"..."} */
-        std::string album_blk = json::object_raw(first, "album");
-        if (!album_blk.empty())
-            album_mid = json::str(album_blk, "mid");
-    }
-    if (!album_mid.empty()) {
-        /* Standard QQ Music CDN pattern: T002R300x300M000{albummid}_1.jpg */
-        info.cover_url = L"https://y.gtimg.cn/music/photo_new/T002R300x300M000"
-                       + json::to_wide(album_mid)
-                       + L"_1.jpg";
-        log(L"search_song: cover_url=" + info.cover_url);
+    /* ── Step 2: fetch song detail to get album mid for cover URL (non-fatal) */
+    if (!mid_str.empty()) {
+        std::wstring detail_path =
+            L"/v8/fcg-bin/fcg_play_single_song.fcg?songmid="
+            + json::to_wide(mid_str)
+            + L"&tmeAppID=qqmusic&format=json&inCharset=utf-8&outCharset=utf-8"
+            L"&notice=0&platform=yqq.json&needNewCode=0";
+
+        std::string detail_raw;
+        std::wstring detail_err;
+        if (m_http.get(detail_path, detail_raw, detail_err)) {
+            /* response: {"code":0,"data":[{"album":{"mid":"..."},...},...]} */
+            std::string darr = json::array_raw(detail_raw, "data");
+            if (!darr.empty()) {
+                auto ditems = json::array_items(darr);
+                if (!ditems.empty()) {
+                    std::string album_blk = json::object_raw(ditems[0], "album");
+                    if (!album_blk.empty()) {
+                        std::string album_mid = json::str(album_blk, "mid");
+                        if (!album_mid.empty()) {
+                            info.cover_url =
+                                L"https://y.gtimg.cn/music/photo_new/T002R300x300M000"
+                                + json::to_wide(album_mid)
+                                + L"_1.jpg";
+                            log(L"search_song: cover_url=" + info.cover_url);
+                        }
+                    }
+                }
+            }
+        } else {
+            loga("search_song: detail fetch failed (non-fatal): "
+                 + json::to_utf8(detail_err));
+        }
     }
 
     return info;

@@ -356,8 +356,14 @@ DanmakuUIInstance::~DanmakuUIInstance() {
         g_monitor->setOnPlayState(nullptr, nullptr);
     }
 
-    // 等待正在进行的异步请求完成（最多等 200ms）
-    for (int i = 0; i < 20 && g_fetching.load(); ++i) {
+    // 立即触发取消：令所有后台 worker 的 cancelled() 返回 true，
+    // 使其尽快退出循环，不再访问 g_engine / g_music。
+    // 注意：此处必须在等待之前执行，否则 worker 的 Sleep(200ms)
+    // 恰好与旧的 200ms 等待上限相等，必然造成 use-after-free。
+    ++g_trackGen;
+
+    // 等待正在进行的异步请求完成（最多等 2000ms）
+    for (int i = 0; i < 200 && g_fetching.load(); ++i) {
         Sleep(10);
     }
     g_fetching = false;
@@ -370,7 +376,9 @@ DanmakuUIInstance::~DanmakuUIInstance() {
     delete g_engine;
     g_engine = nullptr;
 
-    if (g_music) { music_client_destroy(g_music); g_music = nullptr; }
+    // 注意：g_music 的生命周期由 DanmakuProviderInit::on_quit() 统一管理，
+    // 此处不再重复销毁——若在 worker 仍持有 session 时销毁 g_music
+    // 会导致 music_client_last_error(g_music) 等调用访问悬空指针。
 
     ensureGdiplusShutdown();
 }
@@ -492,13 +500,17 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
         while (!serverExhausted && !cancelled() && pagesFetched < kMaxPages) {
             // Wait until the engine's pool is running low.
             while (!cancelled()) {
+                if (!g_engine) break; // engine 已被销毁，立即退出
                 int remaining = g_engine->poolRemaining();
                 int total     = g_engine->poolSize();
                 // remaining counts unread items in CURRENT cycle; once it wraps
                 // (remaining == total) we've started replaying — also a signal
                 // to prefetch ASAP.
                 if (remaining <= kLowWaterMark || remaining == total) break;
-                Sleep(kSleepTickMs);
+                // 分段短睡眠（每次 10ms）以便 cancelled() 能被及时响应，
+                // 避免一次 Sleep(200ms) 耗尽析构函数的全部等待预算。
+                for (int s = 0; s < kSleepTickMs / 10 && !cancelled(); ++s)
+                    Sleep(10);
             }
             if (cancelled()) break;
 
@@ -513,7 +525,9 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
                                  + L" err=" + music_client_last_error(g_music);
                 danmaku_logW(err.c_str());
                 // Don't kill the loop on transient errors — back off and retry once.
-                Sleep(2000);
+                // 同样使用可中断睡眠，避免析构时卡住 2 秒。
+                for (int s = 0; s < 200 && !cancelled(); ++s)
+                    Sleep(10);
                 if (cancelled()) break;
                 continue;
             }
@@ -524,7 +538,7 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
                 std::wstring msg = L"[Danmaku] page#"
                                  + std::to_wstring(pagesFetched)
                                  + L" got=" + std::to_wstring(delivered)
-                                 + L" poolSize=" + std::to_wstring(g_engine->poolSize());
+                                 + L" poolSize=" + std::to_wstring(g_engine ? g_engine->poolSize() : 0);
                 danmaku_logW(msg.c_str());
             }
 
@@ -535,7 +549,14 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
             }
         }
 
-        for (int i = 0; i < 50 && !coverDone->load(); ++i) Sleep(10);
+        // 等待封面抓取线程完成后再关闭 session。
+        // 旧代码只等 50×10ms = 500ms，但 provider 封面需要一次完整的 HTTP
+        // 请求（实测可超过 1 秒），期间两个线程共享同一个 session 句柄。
+        // 一旦 streaming worker 超时关闭 session，cover art 线程再调用
+        // music_client_track_fetch_cover(session) 就会访问已释放内存 → 崩溃。
+        // 改为最多等 30 秒（300×100ms），同时响应取消信号以免阻塞析构。
+        for (int i = 0; i < 300 && !coverDone->load() && !cancelled(); ++i)
+            Sleep(100);
         music_client_close_track_session(session);
         if (!cancelled()) g_fetching = false;
     }).detach();

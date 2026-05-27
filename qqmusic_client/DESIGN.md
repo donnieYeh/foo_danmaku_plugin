@@ -1,8 +1,8 @@
 # qqmusic_client — 设计文档
 
-> 版本：v1.0  
-> 日期：2026-05-24  
-> 状态：已实现
+> 版本：v1.1  
+> 日期：2026-05-27  
+> 状态：已实现（API 兼容性修复）
 
 ---
 
@@ -72,24 +72,64 @@ windsurf/
 
 ### 4.1 搜索
 
+#### ⚠️ 端点迁移说明（2026-05）
+
+原 `soso/fcgi-bin/client_search_cp` 端点已被服务端封禁（持续返回非预期错误码或空响应）。
+当前实现切换到 **smartbox**（搜索建议）端点，并以独立的 **song detail** 调用拉取专辑信息。
+即一次搜索 = **两跳 HTTP**。
+
+> `check_api_code` 仍保留 `code==0` 与 `code==200` 双判定，作为防御性兼容（smartbox 实际返回 `code:0`）。
+
+#### Step 1 — smartbox（拿 id / mid）
+
 ```
-GET https://c.y.qq.com/soso/fcgi-bin/client_search_cp
-    ?w={URL编码的关键词}
-    &p=1&n=10
+GET https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg
+    ?is_xml=0
+    &key={URL编码的关键词}
+    &g_tk=5381&loginUin=0&hostUin=0
     &format=json&inCharset=utf-8&outCharset=utf-8
-    &notice=0&platform=yqq.json&needNewCode=0
-    &ct=24&cv=4747474
+    &notice=0&platform=yqq.json&needNewCode=1
 Referer: https://y.qq.com/
 ```
 
-响应 JSON 路径：`data → song → list[0]`
+响应结构：
 
-| 字段 | 说明 |
+```json
+{"code":0,"data":{"song":{"count":N,"itemlist":[
+    {"id":"97773","mid":"004Z8Ihr0JIu5s","name":"...","singer":"..."},
+    ...
+]}}}
+```
+
+| JSON 路径 | 说明 |
 |---|---|
-| `songmid` | 字母数字混合 ID，如 `"001OLkXf2nqxZ9"` |
-| `albummid` | 专辑 ID，用于拼接封面 URL |
+| `data.song.count` | 命中数量；`0` 视为未找到 |
+| `data.song.itemlist[0].id` | **JSON 字符串**形式的数字 ID（评论 API 的 `topid`） |
+| `data.song.itemlist[0].mid` | 字母数字混合 mid，如 `"001OLkXf2nqxZ9"` |
 
-封面 URL 格式：`https://y.gtimg.cn/music/photo_new/T002R300x300M000{albummid}_1.jpg`
+> 注意：smartbox 响应**不包含**专辑 mid，因此封面 URL 需要 Step 2。
+> 此外 `id` 字段为字符串，解析时先用 `json::num` 尝试，失败则 `json::str` + `std::stoll` 兜底。
+
+#### Step 2 — song detail（拿 album mid → 封面 URL，非致命）
+
+```
+GET https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg
+    ?songmid={mid}
+    &tmeAppID=qqmusic
+    &format=json&inCharset=utf-8&outCharset=utf-8
+    &notice=0&platform=yqq.json&needNewCode=0
+Referer: https://y.qq.com/
+```
+
+响应：`{"code":0,"data":[{"album":{"mid":"..."}, ...}]}`
+
+| JSON 路径 | 用途 |
+|---|---|
+| `data[0].album.mid` | 拼接封面 URL |
+
+封面 URL 格式：`https://y.gtimg.cn/music/photo_new/T002R300x300M000{album.mid}_1.jpg`
+
+> Step 2 失败仅记日志，不影响搜索结果返回——`SongInfo.id` / `SongInfo.mid` 仍可用于后续评论拉取。
 
 ### 4.2 评论（单页）
 

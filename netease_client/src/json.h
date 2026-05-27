@@ -13,6 +13,9 @@ std::string str(const std::string& json, const std::string& key,
 long long num(const std::string& json, const std::string& key,
               long long def = 0);
 
+/** Extract the raw JSON object string for a key (the "{…}" portion). */
+std::string object_raw(const std::string& json, const std::string& key);
+
 /** Extract the raw JSON array string for a key (the "[…]" portion). */
 std::string array_raw(const std::string& json, const std::string& key);
 
