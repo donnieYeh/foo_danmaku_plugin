@@ -22,6 +22,9 @@
 #include <windows.h>
 #include <algorithm>
 #include <string>
+#include <cwctype>
+#include <vector>
+#include <sstream>
 
 namespace qqmusic {
 
@@ -121,6 +124,37 @@ static bool check_api_code(const std::string& resp,
     return true;
 }
 
+static std::wstring normalize_str(const std::wstring& src) {
+    if (src.empty()) return L"";
+    // Convert to simplified Chinese and lowercase using LCMapStringW
+    int size = LCMapStringW(LOCALE_USER_DEFAULT, LCMAP_SIMPLIFIED_CHINESE | LCMAP_LOWERCASE, src.c_str(), (int)src.size(), nullptr, 0);
+    if (size <= 0) return L"";
+    std::wstring dest(size, L'\0');
+    LCMapStringW(LOCALE_USER_DEFAULT, LCMAP_SIMPLIFIED_CHINESE | LCMAP_LOWERCASE, src.c_str(), (int)src.size(), &dest[0], size);
+
+    std::wstring filtered;
+    filtered.reserve(dest.size());
+    for (wchar_t c : dest) {
+        if (iswspace(c) || iswpunct(c)) continue;
+        if (c == L'（' || c == L'）' || c == L'【' || c == L'】' || c == L'「' || c == L'」' || c == L'～' || c == L'~') continue;
+        filtered += c;
+    }
+    return filtered;
+}
+
+static std::vector<std::wstring> split_keyword_to_terms(const std::wstring& keyword) {
+    std::vector<std::wstring> terms;
+    std::wstringstream ss(keyword);
+    std::wstring item;
+    while (std::getline(ss, item, L' ')) {
+        std::wstring norm = normalize_str(item);
+        if (!norm.empty()) {
+            terms.push_back(norm);
+        }
+    }
+    return terms;
+}
+
 /* ── search_song_info ────────────────────────────────── */
 
 SongInfo ApiClient::search_song_info(
@@ -179,13 +213,45 @@ SongInfo ApiClient::search_song_info(
         return info;
     }
 
-    const std::string& first = songs[0];
+    // Rank and select the best matching song
+    int best_index = 0;
+    int max_matches = -1;
+    auto query_terms = split_keyword_to_terms(keyword);
+
+    for (int i = 0; i < (int)songs.size(); i++) {
+        const auto& item = songs[i];
+        std::wstring title = json::to_wide(json::str(item, "name"));
+        std::wstring norm_title = normalize_str(title);
+
+        std::wstring artist = json::to_wide(json::str(item, "singer"));
+        std::wstring norm_artist = normalize_str(artist);
+
+        int matched_count = 0;
+        for (const auto& term : query_terms) {
+            bool term_found = false;
+            if (norm_title.find(term) != std::wstring::npos) {
+                term_found = true;
+            } else if (norm_artist.find(term) != std::wstring::npos) {
+                term_found = true;
+            }
+            if (term_found) {
+                matched_count++;
+            }
+        }
+
+        if (matched_count > max_matches) {
+            max_matches = matched_count;
+            best_index = i;
+        }
+    }
+
+    const std::string& best_song = songs[best_index];
 
     /* smartbox returns id as a JSON string ("id":"97773"), not a number.
      * Try json::num first (handles both); fall back to str+stoll. */
-    long long id_num = json::num(first, "id", 0);
+    long long id_num = json::num(best_song, "id", 0);
     if (id_num == 0) {
-        std::string id_str = json::str(first, "id");
+        std::string id_str = json::str(best_song, "id");
         if (!id_str.empty()) {
             try { id_num = std::stoll(id_str); } catch (...) {}
         }
@@ -196,9 +262,9 @@ SongInfo ApiClient::search_song_info(
         return info;
     }
     info.id = std::to_wstring(id_num);
-    log(L"search_song: id=" + info.id);
+    log(L"search_song: selected index=" + std::to_wstring(best_index) + L" id=" + info.id + L" term_matches=" + std::to_wstring(max_matches));
 
-    std::string mid_str = json::str(first, "mid");
+    std::string mid_str = json::str(best_song, "mid");
     info.mid = json::to_wide(mid_str);
     if (!info.mid.empty())
         log(L"search_song: mid=" + info.mid);

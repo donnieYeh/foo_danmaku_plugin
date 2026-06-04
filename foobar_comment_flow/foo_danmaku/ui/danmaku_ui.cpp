@@ -1,4 +1,4 @@
-﻿// danmaku_ui.cpp - UI element implementation for foobar2000 danmaku plugin
+// danmaku_ui.cpp - UI element implementation for foobar2000 danmaku plugin
 #include "ui/danmaku_ui.h"
 #include "ui/danmaku_preferences.h"
 #include "../core/danmaku_engine.h"
@@ -184,7 +184,7 @@ static int __stdcall comment_cb(
     return 0; // continue
 }
 
-static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void* userdata);
+static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, const wchar_t* album, void* userdata);
 static void onPlayStateCallback(bool playing, void* userdata);
 
 static void fetchAndApplyCoverArtAsync(
@@ -383,7 +383,7 @@ DanmakuUIInstance::~DanmakuUIInstance() {
     ensureGdiplusShutdown();
 }
 
-static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void* userdata) {
+static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, const wchar_t* album, void* userdata) {
     DanmakuUIWindow* wnd = reinterpret_cast<DanmakuUIWindow*>(userdata);
     if (!wnd || !g_music || !g_engine) {
         danmaku_log("[Danmaku] onNewTrack: guard failed (wnd/music/engine null)");
@@ -393,6 +393,7 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
 
     std::wstring titleStr (title  ? title  : L"");
     std::wstring artistStr(artist ? artist : L"");
+    std::wstring albumStr (album  ? album  : L"");
     if (titleStr.empty()) {
         danmaku_log("[Danmaku] onNewTrack: empty title, skipping");
         g_fetching = false;
@@ -402,7 +403,8 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
     // Log that we received a new track
     {
         std::wstring info = L"[Danmaku] New track → title=\"" + titleStr
-                          + L"\" artist=\"" + artistStr + L"\"";
+                          + L"\" artist=\"" + artistStr
+                          + L"\" album=\"" + albumStr + L"\"";
         danmaku_logW(info.c_str());
     }
 
@@ -424,7 +426,7 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
     metadb_handle_ptr currentTrack;
     if (g_monitor) currentTrack = g_monitor->getCurrentTrack();
 
-    std::thread([targetHwnd, titleStr, artistStr, currentTrack, gen]() {
+    std::thread([targetHwnd, titleStr, artistStr, albumStr, currentTrack, gen]() {
         const int  kInitialBurst   = 100;   // first batch — enough to start playing
         const int  kPageSize       = 50;    // incremental page size
         const int  kLowWaterMark   = 30;    // when poolRemaining ≤ this, prefetch
@@ -441,7 +443,7 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, void
         MusicTrackQuery query = {};
         query.title = titleStr.c_str();
         query.artist = artistStr.empty() ? nullptr : artistStr.c_str();
-        query.album = nullptr;
+        query.album = albumStr.empty() ? nullptr : albumStr.c_str();
         query.duration_ms = 0;
 
         MusicTrackSessionHandle session = nullptr;

@@ -19,6 +19,9 @@
 #include <vector>
 #include <cstdlib>
 #include <chrono>
+#include <mutex>
+#include <algorithm>
+#include <cwctype>
 
 /* Pull in urlmon at link time (propagates to the consuming DLL via .obj). */
 #pragma comment(lib, "urlmon.lib")
@@ -66,6 +69,7 @@ struct TrackSessionCtx {
     std::wstring                     keyword;
     std::vector<TrackProviderState>  provider_states;
     int                              active_comment_provider = -1;
+    std::mutex                       mutex;
 };
 
 /* ── helpers ─────────────────────────────────────────── */
@@ -78,13 +82,146 @@ static TrackSessionCtx* session_ctx(MusicTrackSessionHandle s) {
     return reinterpret_cast<TrackSessionCtx*>(s);
 }
 
+static std::wstring clean_artist_part(const std::wstring& part) {
+    size_t start = part.find_first_not_of(L" \t\r\n");
+    if (start == std::wstring::npos) return L"";
+    size_t end = part.find_last_not_of(L" \t\r\n");
+    std::wstring s = part.substr(start, end - start + 1);
+
+    std::wstring lower = s;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+    if (lower.find(L"作詞") != std::wstring::npos ||
+        lower.find(L"作词") != std::wstring::npos ||
+        lower.find(L"lyric") != std::wstring::npos ||
+        lower.find(L"作曲") != std::wstring::npos ||
+        lower.find(L"composer") != std::wstring::npos ||
+        lower.find(L"music") != std::wstring::npos ||
+        lower.find(L"編曲") != std::wstring::npos ||
+        lower.find(L"编曲") != std::wstring::npos ||
+        lower.find(L"arrange") != std::wstring::npos ||
+        lower.find(L"illustration") != std::wstring::npos ||
+        lower.find(L"插画") != std::wstring::npos) {
+        return L"";
+    }
+
+    const wchar_t* prefixes[] = { L"歌:", L"歌：", L"vocal:", L"vocal：", L"cv:", L"cv：", L"c.v.：", L"c.v.:" };
+    for (const wchar_t* prefix : prefixes) {
+        std::wstring p(prefix);
+        if (lower.compare(0, p.length(), p) == 0) {
+            s = s.substr(p.length());
+            start = s.find_first_not_of(L" \t\r\n");
+            if (start == std::wstring::npos) return L"";
+            end = s.find_last_not_of(L" \t\r\n");
+            s = s.substr(start, end - start + 1);
+            break;
+        }
+    }
+
+    lower = s;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+    const wchar_t* suffixes[] = { L"(歌)", L"（歌）", L"(cv)", L"（cv）", L"(vocal)", L"（vocal）" };
+    for (const wchar_t* suffix : suffixes) {
+        std::wstring suf(suffix);
+        if (suf.length() <= lower.length() && 
+            lower.compare(lower.length() - suf.length(), suf.length(), suf) == 0) {
+            s = s.substr(0, s.length() - suf.length());
+            start = s.find_first_not_of(L" \t\r\n");
+            if (start == std::wstring::npos) return L"";
+            end = s.find_last_not_of(L" \t\r\n");
+            s = s.substr(start, end - start + 1);
+            break;
+        }
+    }
+
+    return s;
+}
+
+static std::wstring clean_artist(const std::wstring& artist) {
+    if (artist.empty()) return L"";
+
+    std::vector<std::wstring> parts;
+    std::wstring current;
+    for (wchar_t c : artist) {
+        if (c == L'/' || c == L';' || c == L',' || c == L'，' || c == L'、' || c == L'|') {
+            if (!current.empty()) {
+                parts.push_back(current);
+                current.clear();
+            }
+        } else {
+            current += c;
+        }
+    }
+    if (!current.empty()) {
+        parts.push_back(current);
+    }
+
+    std::wstring cleaned;
+    for (const auto& part : parts) {
+        std::wstring cleaned_part = clean_artist_part(part);
+        if (!cleaned_part.empty()) {
+            if (!cleaned.empty()) cleaned += L" ";
+            cleaned += cleaned_part;
+        }
+    }
+
+    if (cleaned.empty()) {
+        return clean_artist_part(artist);
+    }
+    return cleaned;
+}
+
+static std::wstring clean_title(const std::wstring& title) {
+    if (title.empty()) return L"";
+    int parens = 0;
+    for (wchar_t c : title) {
+        if (c == L'(' || c == L'（') parens++;
+        else if (c == L')' || c == L'）') parens--;
+    }
+    std::wstring t = title;
+    if (parens > 0) {
+        size_t pos = t.find_last_of(L"(（");
+        if (pos != std::wstring::npos) {
+            t = t.substr(0, pos);
+        }
+    }
+    size_t start = t.find_first_not_of(L" \t\r\n");
+    if (start == std::wstring::npos) return L"";
+    size_t end = t.find_last_not_of(L" \t\r\n");
+    return t.substr(start, end - start + 1);
+}
+
+static std::wstring clean_album(const std::wstring& album) {
+    if (album.empty()) return L"";
+    std::wstring a = album;
+    int parens = 0;
+    for (wchar_t c : a) {
+        if (c == L'(' || c == L'（') parens++;
+        else if (c == L')' || c == L'）') parens--;
+    }
+    if (parens > 0) {
+        size_t pos = a.find_last_of(L"(（");
+        if (pos != std::wstring::npos) {
+            a = a.substr(0, pos);
+        }
+    }
+    size_t start = a.find_first_not_of(L" \t\r\n");
+    if (start == std::wstring::npos) return L"";
+    size_t end = a.find_last_not_of(L" \t\r\n");
+    return a.substr(start, end - start + 1);
+}
+
 static std::wstring build_keyword(const std::wstring& title,
-                                  const std::wstring& artist)
+                                  const std::wstring& artist,
+                                  const std::wstring& album)
 {
     std::wstring kw = title;
     if (!artist.empty()) {
         if (!kw.empty()) kw += L" ";
         kw += artist;
+    }
+    if (!album.empty()) {
+        if (!kw.empty()) kw += L" ";
+        kw += album;
     }
     return kw;
 }
@@ -98,26 +235,71 @@ static int resolve_provider_for_session(
     if (provider_idx < 0 || provider_idx >= (int)c->providers.size())
         return MUSIC_ERR_PARAM;
 
+    DWORD tid = GetCurrentThreadId();
+    c->log(std::wstring(L"[music_client] [TID:") + std::to_wstring(tid) + L"] resolve_provider enter for provider=" + std::to_wstring(provider_idx));
+
+    std::lock_guard<std::mutex> lock(sess->mutex);
+
+    c->log(std::wstring(L"[music_client] [TID:") + std::to_wstring(tid) + L"] resolve_provider acquired lock for provider=" + std::to_wstring(provider_idx));
+
     TrackProviderState& st = sess->provider_states[provider_idx];
-    if (st.resolved) return MUSIC_OK;
-    if (st.tried_resolve) return MUSIC_ERR_NOTFOUND;
+    if (st.resolved) {
+        c->log(std::wstring(L"[music_client] [TID:") + std::to_wstring(tid) + L"] resolve_provider already resolved, returning OK");
+        return MUSIC_OK;
+    }
+    if (st.tried_resolve) {
+        c->log(std::wstring(L"[music_client] [TID:") + std::to_wstring(tid) + L"] resolve_provider already tried, returning NOTFOUND");
+        return MUSIC_ERR_NOTFOUND;
+    }
     st.tried_resolve = true;
 
     ProviderSlot& p = c->providers[provider_idx];
+
+    std::vector<std::wstring> keywords;
+    std::wstring cleaned_title = clean_title(sess->title);
+    std::wstring cleaned_artist = clean_artist(sess->artist);
+    std::wstring cleaned_album = clean_album(sess->album);
+
+    // Attempt 1: Title + Artist + Album
+    std::wstring kw1 = build_keyword(cleaned_title, cleaned_artist, cleaned_album);
+    if (!kw1.empty()) keywords.push_back(kw1);
+
+    // Attempt 2: Title + Artist
+    std::wstring kw2 = build_keyword(cleaned_title, cleaned_artist, L"");
+    if (!kw2.empty() && kw2 != kw1) keywords.push_back(kw2);
+
+    // Attempt 3: Title
+    std::wstring kw3 = cleaned_title;
+    if (!kw3.empty() && kw3 != kw2 && kw3 != kw1) keywords.push_back(kw3);
+
+    if (keywords.empty()) {
+        keywords.push_back(sess->keyword);
+    }
+
+    int rc = MUSIC_ERR_NOTFOUND;
     wchar_t song_id[128] = {};
     wchar_t cover_url[2048] = {};
-    int rc = p.vtable->search_song(
-        p.handle,
-        sess->keyword.c_str(),
-        song_id, (int)_countof(song_id),
-        cover_url, (int)_countof(cover_url));
 
-    if (rc != MUSIC_OK) {
+    for (const auto& kw : keywords) {
+        c->log(L"[music_client] attempting search for provider=" + std::to_wstring(provider_idx) + L" with keyword: " + kw);
+        song_id[0] = L'\0';
+        cover_url[0] = L'\0';
+        rc = p.vtable->search_song(
+            p.handle,
+            kw.c_str(),
+            song_id, (int)_countof(song_id),
+            cover_url, (int)_countof(cover_url));
+        if (rc == MUSIC_OK && song_id[0] != L'\0') {
+            break;
+        }
+    }
+
+    if (rc != MUSIC_OK || song_id[0] == L'\0') {
         c->last_error = p.vtable->last_error(p.handle);
-        c->log(std::wstring(L"[music_client] provider[") + p.path
+        c->log(std::wstring(L"[music_client] [TID:") + std::to_wstring(tid) + L"] provider[" + p.path
                + L"] track resolve failed (rc=" + std::to_wstring(rc)
                + L"), trying next");
-        return rc;
+        return (rc == MUSIC_OK) ? MUSIC_ERR_NOTFOUND : rc;
     }
 
     st.song_id = song_id;
@@ -125,10 +307,11 @@ static int resolve_provider_for_session(
     st.resolved = !st.song_id.empty();
     if (!st.resolved) {
         c->last_error = L"Provider resolved empty song id";
+        c->log(std::wstring(L"[music_client] [TID:") + std::to_wstring(tid) + L"] resolve_provider returned empty song ID");
         return MUSIC_ERR_NOTFOUND;
     }
 
-    c->log(std::wstring(L"[music_client] track resolved by provider[")
+    c->log(std::wstring(L"[music_client] [TID:") + std::to_wstring(tid) + L"] track resolved by provider["
            + p.path + L"]");
     return MUSIC_OK;
 }
@@ -357,7 +540,7 @@ int music_client_open_track_session(
     s->artist      = query->artist ? query->artist : L"";
     s->album       = query->album  ? query->album  : L"";
     s->duration_ms = query->duration_ms;
-    s->keyword     = build_keyword(s->title, s->artist);
+    s->keyword     = build_keyword(s->title, s->artist, s->album);
     s->provider_states.resize(c->providers.size());
 
     *out_session = s;

@@ -6,7 +6,7 @@
 
 class PlaybackMonitor : public play_callback_impl_base {
 public:
-    typedef void (*OnNewTrackCallback)(const wchar_t* title, const wchar_t* artist, void* userdata);
+    typedef void (*OnNewTrackCallback)(const wchar_t* title, const wchar_t* artist, const wchar_t* album, void* userdata);
     typedef void (*OnPlayStateCallback)(bool playing, void* userdata);
 
     PlaybackMonitor();

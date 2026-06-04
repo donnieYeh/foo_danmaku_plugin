@@ -22,6 +22,9 @@
 #include <windows.h>
 #include <string>
 #include <algorithm>
+#include <cwctype>
+#include <vector>
+#include <sstream>
 
 namespace netease {
 
@@ -117,6 +120,37 @@ int ApiClient::weapi(
     return out_resp.empty() ? NETEASE_ERR_API : NETEASE_OK;
 }
 
+static std::wstring normalize_str(const std::wstring& src) {
+    if (src.empty()) return L"";
+    // Convert to simplified Chinese and lowercase using LCMapStringW
+    int size = LCMapStringW(LOCALE_USER_DEFAULT, LCMAP_SIMPLIFIED_CHINESE | LCMAP_LOWERCASE, src.c_str(), (int)src.size(), nullptr, 0);
+    if (size <= 0) return L"";
+    std::wstring dest(size, L'\0');
+    LCMapStringW(LOCALE_USER_DEFAULT, LCMAP_SIMPLIFIED_CHINESE | LCMAP_LOWERCASE, src.c_str(), (int)src.size(), &dest[0], size);
+
+    std::wstring filtered;
+    filtered.reserve(dest.size());
+    for (wchar_t c : dest) {
+        if (iswspace(c) || iswpunct(c)) continue;
+        if (c == L'（' || c == L'）' || c == L'【' || c == L'】' || c == L'「' || c == L'」' || c == L'～' || c == L'~') continue;
+        filtered += c;
+    }
+    return filtered;
+}
+
+static std::vector<std::wstring> split_keyword_to_terms(const std::wstring& keyword) {
+    std::vector<std::wstring> terms;
+    std::wstringstream ss(keyword);
+    std::wstring item;
+    while (std::getline(ss, item, L' ')) {
+        std::wstring norm = normalize_str(item);
+        if (!norm.empty()) {
+            terms.push_back(norm);
+        }
+    }
+    return terms;
+}
+
 /* ── search_song ─────────────────────────────────────── */
 
 std::wstring ApiClient::search_song(
@@ -164,30 +198,105 @@ SongInfo ApiClient::search_song_info(
         return info;
     }
 
-    /* The legacy /api/search/get/web song object contains nested album/artist
-     * objects before the song's own id.  json::num() returns the FIRST "id",
-     * which can be album.artist.id == 0, so read the last id in this item. */
-    long long id = num_last(songs[0], "id", 0);
+    // Rank and select the best matching song
+    int best_index = 0;
+    int max_matches = -1;
+    auto query_terms = split_keyword_to_terms(keyword);
+
+    for (int i = 0; i < (int)songs.size(); i++) {
+        const auto& item = songs[i];
+        std::wstring title = json::to_wide(json::str(item, "name"));
+        std::wstring norm_title = normalize_str(title);
+
+        std::string artists_raw = json::array_raw(item, "artists");
+        auto artist_items = json::array_items(artists_raw);
+        std::vector<std::wstring> artists;
+        for (const auto& art : artist_items) {
+            artists.push_back(normalize_str(json::to_wide(json::str(art, "name"))));
+        }
+
+        std::string album_blk = json::object_raw(item, "album");
+        std::wstring album_name = normalize_str(json::to_wide(json::str(album_blk, "name")));
+
+        int matched_count = 0;
+        for (const auto& term : query_terms) {
+            bool term_found = false;
+            if (norm_title.find(term) != std::wstring::npos) {
+                term_found = true;
+            } else if (album_name.find(term) != std::wstring::npos) {
+                term_found = true;
+            } else {
+                for (const auto& art : artists) {
+                    if (art.find(term) != std::wstring::npos) {
+                        term_found = true;
+                        break;
+                    }
+                }
+            }
+            if (term_found) {
+                matched_count++;
+            }
+        }
+
+        if (matched_count > max_matches) {
+            max_matches = matched_count;
+            best_index = i;
+        }
+    }
+
+    const auto& best_song = songs[best_index];
+    long long id = num_last(best_song, "id", 0);
     if (id == 0) {
         error_msg = L"Failed to parse song ID";
-        log(L"songs[0]=" + json::to_wide(songs[0].substr(0, 80)));
+        log(L"best_song=" + json::to_wide(best_song.substr(0, 80)));
         return info;
     }
-    log(L"search_song: found id=" + std::to_wstring(id));
+    log(L"search_song: selected index=" + std::to_wstring(best_index) + L" id=" + std::to_wstring(id) + L" term_matches=" + std::to_wstring(max_matches));
     info.id = std::to_wstring(id);
 
-    /* /api/search/get/web: cover is usually at songs[0].album.picUrl.
-     * Keep songs[0].al.picUrl and songs[0].picUrl as fallbacks for forward compat. */
-    std::string album_blk = json::object_raw(songs[0], "album");
+    /* /api/search/get/web: cover is usually at songs[best_index].album.picUrl.
+     * Keep songs[best_index].al.picUrl and songs[best_index].picUrl as fallbacks for forward compat. */
+    std::string album_blk = json::object_raw(best_song, "album");
     if (!album_blk.empty())
         info.cover_url = json::to_wide(json::str(album_blk, "picUrl"));
     if (info.cover_url.empty()) {
-        std::string al_blk = json::object_raw(songs[0], "al");
+        std::string al_blk = json::object_raw(best_song, "al");
         if (!al_blk.empty())
             info.cover_url = json::to_wide(json::str(al_blk, "picUrl"));
     }
     if (info.cover_url.empty())
-        info.cover_url = json::to_wide(json::str(songs[0], "picUrl"));
+        info.cover_url = json::to_wide(json::str(best_song, "picUrl"));
+
+    /* Fallback: if search response doesn't have a cover URL, fetch song details */
+    if (info.cover_url.empty() && !info.id.empty()) {
+        log(L"search_song: cover_url empty in search response, trying song/detail fallback...");
+        std::string detail_resp;
+        std::wstring detail_err;
+        std::string detail_payload = "{\"c\":\"[{\\\"id\\\":" + json::to_utf8(info.id) + "}]\",\"ids\":\"[" + json::to_utf8(info.id) + "]\"}";
+        int detail_rc = weapi(L"/weapi/v3/song/detail", detail_payload, detail_resp, detail_err);
+        if (detail_rc == NETEASE_OK && !detail_resp.empty()) {
+            std::string detail_songs_raw = json::array_raw(detail_resp, "songs");
+            auto detail_songs = json::array_items(detail_songs_raw);
+            if (!detail_songs.empty()) {
+                std::string al_blk = json::object_raw(detail_songs[0], "al");
+                if (!al_blk.empty()) {
+                    info.cover_url = json::to_wide(json::str(al_blk, "picUrl"));
+                }
+                if (info.cover_url.empty()) {
+                    std::string album_blk = json::object_raw(detail_songs[0], "album");
+                    if (!album_blk.empty()) {
+                        info.cover_url = json::to_wide(json::str(album_blk, "picUrl"));
+                    }
+                }
+                if (info.cover_url.empty()) {
+                    info.cover_url = json::to_wide(json::str(detail_songs[0], "picUrl"));
+                }
+            }
+        } else {
+            log(L"search_song: song/detail fallback failed, rc=" + std::to_wstring(detail_rc) + L" err=" + detail_err);
+        }
+    }
+
     if (!info.cover_url.empty()) {
         log(L"search_song: cover_url=" + info.cover_url);
     }

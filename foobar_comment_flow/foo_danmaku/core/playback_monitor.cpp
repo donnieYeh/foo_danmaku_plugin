@@ -63,7 +63,9 @@ void PlaybackMonitor::on_playback_new_track(metadb_handle_ptr p_track) {
         artist = formatTrackField(p_track, "[%album artist%]");
     }
 
-    m_onNewTrack(title.c_str(), artist.c_str(), m_userdata);
+    std::wstring album = formatTrackField(p_track, "[%album%]");
+
+    m_onNewTrack(title.c_str(), artist.c_str(), album.c_str(), m_userdata);
 }
 
 void PlaybackMonitor::on_playback_stop(play_control::t_stop_reason p_reason) {
