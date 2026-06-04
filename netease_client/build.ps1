@@ -13,6 +13,20 @@ $MSVC        = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\V
 $WINSDK_INC  = "C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0"
 $WINSDK_LIB  = "C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0"
 
+if ($env:VCToolsInstallDir) {
+    $MSVC = $env:VCToolsInstallDir.TrimEnd('\')
+}
+if ($env:WindowsSdkDir) {
+    $sdkDir = $env:WindowsSdkDir.TrimEnd('\')
+    $sdkVer = $env:WindowsSDKVersion
+    if (-not $sdkVer) {
+        $sdkVer = (Get-ChildItem "$sdkDir\Include" | Sort-Object Name -Descending | Select-Object -First 1).Name
+    }
+    $sdkVer = $sdkVer.TrimEnd('\')
+    $WINSDK_INC = "$sdkDir\Include\$sdkVer"
+    $WINSDK_LIB = "$sdkDir\Lib\$sdkVer"
+}
+
 if ($Platform -eq "x64") {
     $toolBin = "Hostx64\x64"
     $libArch = "x64"

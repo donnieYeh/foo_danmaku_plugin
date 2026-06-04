@@ -1,0 +1,107 @@
+name: Build and Package
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Release Component
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Download and Extract foobar2000 SDK
+        shell: pwsh
+        run: |
+          $sdkUrl = "https://www.foobar2000.org/downloads/SDK-2025-03-07.7z"
+          $archivePath = "$env:TEMP/SDK-2025-03-07.7z"
+          $extractPath = "foobar_comment_flow/foo_danmaku/SDK"
+          
+          Write-Host "Downloading foobar2000 SDK from $sdkUrl ..."
+          Invoke-WebRequest -Uri $sdkUrl -OutFile $archivePath
+          
+          Write-Host "Extracting to $extractPath ..."
+          if (-not (Test-Path $extractPath)) {
+            New-Item -ItemType Directory -Path $extractPath | Out-Null
+          }
+          # 7z is pre-installed and in PATH on windows-latest runner
+          7z x $archivePath "-o$extractPath" -y
+          Write-Host "SDK extraction complete."
+
+      - name: Determine Version
+        id: get_version
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("vV")
+          Write-Host "Determined version: $version"
+          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+
+      # --- Build Win32 (x86) ---
+      - name: Build music_client (Win32)
+        shell: pwsh
+        run: |
+          pwsh -File music_client/build.ps1 -Platform Win32
+
+      - name: Build netease_client (Win32)
+        shell: pwsh
+        run: |
+          pwsh -File netease_client/build.ps1 -Platform Win32
+
+      - name: Build qqmusic_client (Win32)
+        shell: pwsh
+        run: |
+          pwsh -File qqmusic_client/build.ps1 -Platform Win32
+
+      - name: Build foo_danmaku (Win32)
+        shell: pwsh
+        run: |
+          pwsh -File foobar_comment_flow/foo_danmaku/build.ps1 -Platform Win32
+
+      # --- Build x64 ---
+      - name: Build music_client (x64)
+        shell: pwsh
+        run: |
+          pwsh -File music_client/build.ps1 -Platform x64
+
+      - name: Build netease_client (x64)
+        shell: pwsh
+        run: |
+          pwsh -File netease_client/build.ps1 -Platform x64
+
+      - name: Build qqmusic_client (x64)
+        shell: pwsh
+        run: |
+          pwsh -File qqmusic_client/build.ps1 -Platform x64
+
+      - name: Build foo_danmaku (x64)
+        shell: pwsh
+        run: |
+          pwsh -File foobar_comment_flow/foo_danmaku/build.ps1 -Platform x64
+
+      # --- Package both architectures ---
+      - name: Package Component
+        shell: pwsh
+        run: |
+          pwsh -File foobar_comment_flow/pack.ps1 -Version "${{ steps.get_version.outputs.VERSION }}"
+
+      # --- Create Release and Upload Asset ---
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: foobar_comment_flow/dist/*.fb2k-component
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

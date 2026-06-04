@@ -1,7 +1,5 @@
 param(
-    [string]$Version  = "",
-    [ValidateSet("x64","Win32")]
-    [string]$Platform = "x64"   # 仅用于选择构建产物来源，不影响包内结构
+    [string]$Version  = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,45 +24,54 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = Get-LatestGitTagVersion
 }
 
-$FOO_DANMAKU_DLL = "$PROJECT\foo_danmaku\build\$Platform\foo_danmaku.dll"
-$NETEASE_DLL     = "$PROJECT\..\netease_client\build\$Platform\netease_client.dll"
-$QQMUSIC_DLL     = "$PROJECT\..\qqmusic_client\build\$Platform\qqmusic_client.dll"
 $DIST            = "$PROJECT\dist"
 $COMPONENT_NAME  = "foo_danmaku"
 $OUTFILE         = "$DIST\${COMPONENT_NAME}-${Version}.fb2k-component"
 
-# ── Prerequisite checks ────────────────────────────────
-foreach ($f in @($FOO_DANMAKU_DLL, $NETEASE_DLL)) {
-    if (-not (Test-Path $f)) {
-        throw "Required artifact not found: $f`nRun the build scripts first."
-    }
-}
-# qqmusic_client is optional — only bundled when the build artifact exists.
-$includeQQMusic = Test-Path $QQMUSIC_DLL
+# ── DLL Paths ─────────────────────────────────────────
+$WIN32_FOO_DLL = "$PROJECT\foo_danmaku\build\Win32\foo_danmaku.dll"
+$WIN32_NETEASE_DLL = "$PROJECT\..\netease_client\build\Win32\netease_client.dll"
+$WIN32_QQMUSIC_DLL = "$PROJECT\..\qqmusic_client\build\Win32\qqmusic_client.dll"
 
-Write-Host "Packaging $COMPONENT_NAME v$Version ($Platform) ..."
+$X64_FOO_DLL = "$PROJECT\foo_danmaku\build\x64\foo_danmaku.dll"
+$X64_NETEASE_DLL = "$PROJECT\..\netease_client\build\x64\netease_client.dll"
+$X64_QQMUSIC_DLL = "$PROJECT\..\qqmusic_client\build\x64\qqmusic_client.dll"
+
+# ── Prerequisite checks ────────────────────────────────
+$hasWin32 = (Test-Path $WIN32_FOO_DLL) -and (Test-Path $WIN32_NETEASE_DLL)
+$hasX64   = (Test-Path $X64_FOO_DLL) -and (Test-Path $X64_NETEASE_DLL)
+
+if (-not $hasWin32 -and -not $hasX64) {
+    throw "No build artifacts found. Run the build scripts for Win32 and/or x64 first."
+}
+
+Write-Host "Packaging $COMPONENT_NAME v$Version ..."
 
 # ── Stage area ─────────────────────────────────────────
-# Use a temp subfolder so we don't accidentally include stale files.
 $stage = "$env:TEMP\fb2k_pack_$COMPONENT_NAME"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Path $stage | Out-Null
 
-# ── Copy payload ───────────────────────────────────────
-# foobar2000 直接识别 zip 根目录下的 DLL 作为组件。
-# 只需将两个 DLL 放根目录即可，无需架构子目录。
+# ── Copy Win32 Payload (goes to root) ──────────────────
+if ($hasWin32) {
+    Write-Host "  Adding Win32 binaries to root..."
+    Copy-Item $WIN32_FOO_DLL "$stage\foo_danmaku.dll"
+    Copy-Item $WIN32_NETEASE_DLL     "$stage\netease_client.dll"
+    if (Test-Path $WIN32_QQMUSIC_DLL) {
+        Copy-Item $WIN32_QQMUSIC_DLL "$stage\qqmusic_client.dll"
+    }
+}
 
-Copy-Item $FOO_DANMAKU_DLL "$stage\foo_danmaku.dll"
-Copy-Item $NETEASE_DLL     "$stage\netease_client.dll"
-
-Write-Host "  -> foo_danmaku.dll"
-Write-Host "  -> netease_client.dll"
-
-if ($includeQQMusic) {
-    Copy-Item $QQMUSIC_DLL "$stage\qqmusic_client.dll"
-    Write-Host "  -> qqmusic_client.dll"
-} else {
-    Write-Host "  (qqmusic_client.dll not found — skipped; run qqmusic_client/build.ps1 to include it)"
+# ── Copy x64 Payload (goes to x64/ subdirectory) ───────
+if ($hasX64) {
+    Write-Host "  Adding x64 binaries to x64/..."
+    $stageX64 = "$stage\x64"
+    New-Item -ItemType Directory -Path $stageX64 | Out-Null
+    Copy-Item $X64_FOO_DLL "$stageX64\foo_danmaku.dll"
+    Copy-Item $X64_NETEASE_DLL     "$stageX64\netease_client.dll"
+    if (Test-Path $X64_QQMUSIC_DLL) {
+        Copy-Item $X64_QQMUSIC_DLL "$stageX64\qqmusic_client.dll"
+    }
 }
 
 # ── Create zip and rename to .fb2k-component ──────────
@@ -85,6 +92,10 @@ $size = (Get-Item $OUTFILE).Length
 Write-Host ""
 Write-Host "SUCCESS  $OUTFILE"
 Write-Host "  Size : $([math]::Round($size/1KB, 1)) KB"
+Write-Host ""
+Write-Host "Cross-architecture structure:"
+Write-Host "  Win32 (x86) included: $hasWin32"
+Write-Host "  x64 included        : $hasX64"
 Write-Host ""
 Write-Host "Install:"
 Write-Host "  Double-click the .fb2k-component file, or drag it onto foobar2000."
