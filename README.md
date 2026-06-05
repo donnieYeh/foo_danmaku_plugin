@@ -1,4 +1,4 @@
-# windsurf — FooBar Danmaku
+# FooBar Danmaku
 
 为 foobar2000 音乐播放器开发的弹幕插件，播放时从网易云音乐实时拉取评论，
 以滚动弹幕形式叠加显示在屏幕上。
