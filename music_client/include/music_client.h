@@ -239,6 +239,15 @@ void music_client_set_log(
     MusicClientLogCallback cb,
     void*                 userdata);
 
+/** Set the API key used for DeepSeek song search fallback. */
+void music_client_set_deepseek_api_key(
+    MusicClientHandle h,
+    const char*       api_key);
+
+/** Clear the local DeepSeek cache (both in-memory and deepseek_cache.json). */
+void music_client_clear_deepseek_cache(MusicClientHandle h);
+
+
 #ifdef __cplusplus
 }
 #endif

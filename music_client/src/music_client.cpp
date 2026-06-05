@@ -9,6 +9,8 @@
 
 #include "../include/music_provider.h"
 #include "../include/music_client.h"
+#include "deepseek_client.h"
+
 
 #include <windows.h>
 #include <urlmon.h>     /* URLOpenBlockingStreamW */
@@ -69,6 +71,9 @@ struct TrackSessionCtx {
     std::wstring                     keyword;
     std::vector<TrackProviderState>  provider_states;
     int                              active_comment_provider = -1;
+    bool                             deepseek_tried = false;
+    bool                             deepseek_success = false;
+    DeepSeekCleanResult              deepseek_result;
     std::mutex                       mutex;
 };
 
@@ -187,7 +192,32 @@ static std::wstring clean_title(const std::wstring& title) {
     size_t start = t.find_first_not_of(L" \t\r\n");
     if (start == std::wstring::npos) return L"";
     size_t end = t.find_last_not_of(L" \t\r\n");
-    return t.substr(start, end - start + 1);
+    t = t.substr(start, end - start + 1);
+
+    /* Fix-0: strip leading track-number prefix, e.g. "3.", "01 ", "02-", "3)"
+     * Pattern: one or more digits followed by one or more separator chars
+     * (.  )  -  space/tab), only when real content follows. */
+    {
+        size_t ti = 0;
+        while (ti < t.size() && iswdigit(t[ti])) ti++;
+        if (ti > 0 && ti < t.size()) {
+            wchar_t sep = t[ti];
+            if (sep == L'.' || sep == L')' || sep == L'-' ||
+                sep == L' ' || sep == L'\t') {
+                size_t after = ti;
+                while (after < t.size() &&
+                       (t[after] == L'.' || t[after] == L')' || t[after] == L'-' ||
+                        t[after] == L' '  || t[after] == L'\t')) {
+                    after++;
+                }
+                if (after < t.size()) {  /* guard: ensure actual content remains */
+                    t = t.substr(after);
+                }
+            }
+        }
+    }
+
+    return t;
 }
 
 static std::wstring clean_album(const std::wstring& album) {
@@ -295,10 +325,138 @@ static int resolve_provider_for_session(
     }
 
     if (rc != MUSIC_OK || song_id[0] == L'\0') {
+        if (deepseek_has_api_key()) {
+            c->log(L"[music_client] First-pass keyword search failed. Triggering DeepSeek fallback...");
+            if (!sess->deepseek_tried) {
+                sess->deepseek_tried = true;
+                std::wstring ds_err;
+                sess->deepseek_success = deepseek_clean_metadata(
+                    sess->title, sess->artist, sess->album,
+                    sess->deepseek_result, ds_err);
+                if (!sess->deepseek_success) {
+                    c->log(L"[music_client] DeepSeek fallback failed: " + ds_err);
+                }
+            }
+
+            if (sess->deepseek_success) {
+                // Sort/prioritize CJK/Japanese variants to the front so that Japanese/CJK keywords are searched first
+                std::stable_sort(sess->deepseek_result.variants.begin(), sess->deepseek_result.variants.end(),
+                    [](const DeepSeekSongVariant& a, const DeepSeekSongVariant& b) {
+                        auto has_cjk = [](const std::wstring& s) {
+                            for (wchar_t c : s) {
+                                if (c >= 0x2E80) return true;
+                            }
+                            return false;
+                        };
+                        bool a_cjk = has_cjk(a.title);
+                        bool b_cjk = has_cjk(b.title);
+                        if (a_cjk != b_cjk) {
+                            return a_cjk; // True (a has CJK, b doesn't) comes first
+                        }
+                        return false;
+                    });
+
+                bool found = false;
+                for (const auto& var : sess->deepseek_result.variants) {
+                    std::vector<std::wstring> ds_keywords;
+                    std::wstring ds_title = var.title;
+                    std::wstring ds_artist = var.artist;
+                    std::wstring ds_album = var.album;
+
+                    /* Fix-1 (revised): strip the words that title and album share as a
+                     * leading word-prefix from the album part, to avoid keyword duplication.
+                     *
+                     * e.g. title="Ichigo Complete (Jelly mix)"
+                     *      album="Ichigo Complete - Ichigo Mashimaro OP Single"
+                     * Shared leading words (case-insensitive): "ichigo", "complete"  (2 words)
+                     * Album unique suffix: "Ichigo Mashimaro OP Single"
+                     * → kw1 = "Ichigo Complete (Jelly mix) Ichigo Mashimaro OP Single" */
+                    std::wstring ds_album_part = ds_album;
+                    if (!ds_title.empty() && !ds_album.empty()) {
+                        /* Simple word splitter: splits on whitespace */
+                        auto split_words = [](const std::wstring& s) {
+                            std::vector<std::wstring> toks;
+                            size_t i = 0;
+                            while (i < s.size()) {
+                                while (i < s.size() && iswspace(s[i])) i++;
+                                size_t start = i;
+                                while (i < s.size() && !iswspace(s[i])) i++;
+                                if (i > start) {
+                                    std::wstring w = s.substr(start, i - start);
+                                    std::transform(w.begin(), w.end(), w.begin(), ::towlower);
+                                    toks.push_back(std::move(w));
+                                }
+                            }
+                            return toks;
+                        };
+
+                        auto title_toks = split_words(ds_title);
+                        auto album_toks = split_words(ds_album);
+
+                        /* Count how many leading words are shared */
+                        size_t shared = 0;
+                        while (shared < title_toks.size() && shared < album_toks.size() &&
+                               title_toks[shared] == album_toks[shared]) {
+                            shared++;
+                        }
+
+                        if (shared > 0) {
+                            /* Find the position in ds_album after skipping `shared` words */
+                            size_t pos = 0, skipped = 0;
+                            while (skipped < shared && pos < ds_album.size()) {
+                                while (pos < ds_album.size() && iswspace(ds_album[pos])) pos++;
+                                while (pos < ds_album.size() && !iswspace(ds_album[pos])) pos++;
+                                skipped++;
+                            }
+                            /* Skip separator chars (space, dash, em-dash…) */
+                            static const std::wstring sep_chars = L" \t-\u2013\u2014\u3000";
+                            size_t si = ds_album.find_first_not_of(sep_chars, pos);
+                            ds_album_part = (si != std::wstring::npos) ? ds_album.substr(si) : L"";
+                        }
+                    }
+
+
+                    // Attempt 1: Title + Artist + (de-duplicated) Album
+                    std::wstring kw1 = build_keyword(ds_title, ds_artist, ds_album_part);
+                    if (!kw1.empty()) ds_keywords.push_back(kw1);
+
+                    // Attempt 2: Title + Artist
+                    std::wstring kw2 = build_keyword(ds_title, ds_artist, L"");
+                    if (!kw2.empty() && kw2 != kw1) ds_keywords.push_back(kw2);
+
+                    // Attempt 3: Title
+                    std::wstring kw3 = ds_title;
+                    if (!kw3.empty() && kw3 != kw2 && kw3 != kw1) ds_keywords.push_back(kw3);
+
+                    for (const auto& kw_ds : ds_keywords) {
+                        c->log(L"[music_client] attempting search for provider=" + std::to_wstring(provider_idx) + L" with DeepSeek cleaned keyword: " + kw_ds);
+                        song_id[0] = L'\0';
+                        cover_url[0] = L'\0';
+                        rc = p.vtable->search_song(
+                            p.handle,
+                            kw_ds.c_str(),
+                            song_id, (int)_countof(song_id),
+                            cover_url, (int)_countof(cover_url));
+                        if (rc == MUSIC_OK && song_id[0] != L'\0') {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            c->log(L"[music_client] First-pass keyword search failed. DeepSeek API key is not configured, skipping fallback.");
+        }
+    }
+
+    if (rc != MUSIC_OK || song_id[0] == L'\0') {
         c->last_error = p.vtable->last_error(p.handle);
         c->log(std::wstring(L"[music_client] [TID:") + std::to_wstring(tid) + L"] provider[" + p.path
                + L"] track resolve failed (rc=" + std::to_wstring(rc)
-               + L"), trying next");
+               + L")");
         return (rc == MUSIC_OK) ? MUSIC_ERR_NOTFOUND : rc;
     }
 
@@ -914,3 +1072,18 @@ void music_client_set_log(
         }
     }
 }
+
+void music_client_set_deepseek_api_key(
+    MusicClientHandle h,
+    const char*       api_key)
+{
+    (void)h;
+    deepseek_set_api_key(api_key);
+}
+
+void music_client_clear_deepseek_cache(MusicClientHandle h)
+{
+    (void)h;
+    deepseek_clear_cache();
+}
+

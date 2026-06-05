@@ -7,6 +7,8 @@
 #include "core/provider_manager.h"
 #include "music_client.h"
 #include "music_provider.h"
+#include "ui/danmaku_preferences.h"
+
 
 #include <foobar2000/SDK/foobar2000.h>
 #include <windows.h>
@@ -177,6 +179,9 @@ public:
                 console::print(s.c_str());
             }
         }, nullptr);
+
+        std::string saved_key = danmaku_get_deepseek_api_key();
+        music_client_set_deepseek_api_key(g_music, saved_key.c_str());
 
         reload_providers();
     }

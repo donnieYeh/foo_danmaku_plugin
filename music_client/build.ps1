@@ -45,7 +45,8 @@ foreach ($d in @($BUILDROOT, $OUTDIR, $OBJDIR)) {
 }
 
 $srcFiles = @(
-    "$PROJECT\src\music_client.cpp"
+    "$PROJECT\src\music_client.cpp",
+    "$PROJECT\src\deepseek_client.cpp"
 )
 
 $includeArgs = @(

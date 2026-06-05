@@ -1,4 +1,4 @@
-﻿#include "ui/danmaku_preferences.h"
+#include "ui/danmaku_preferences.h"
 #include "core/provider_manager.h"
 #include <foobar2000/SDK/foobar2000.h>
 #include <foobar2000/SDK/cfg_var.h>
@@ -61,6 +61,15 @@ static cfg_int g_cfg_speed_percent(guid_cfg_speed_percent, kDefaultSpeedPercent)
 static cfg_int g_cfg_turntable_speed_percent(guid_cfg_turntable_speed_percent, kDefaultTurntableSpeedPercent);
 static cfg_int g_cfg_bk_aspect_min(guid_cfg_bk_aspect_min, kDefaultBkAspectMinTenths);
 static cfg_int g_cfg_bk_aspect_max(guid_cfg_bk_aspect_max, kDefaultBkAspectMaxTenths);
+
+// {4D2A98BC-E2E1-4DAE-9F93-7848F2A832BE}
+static constexpr GUID guid_cfg_deepseek_api_key =
+{ 0x4d2a98bc, 0xe2e1, 0x4dae, { 0x9f, 0x93, 0x78, 0x48, 0xf2, 0xa8, 0x32, 0xbe } };
+static cfg_string g_cfg_deepseek_api_key(guid_cfg_deepseek_api_key, "");
+
+std::string danmaku_get_deepseek_api_key() { return g_cfg_deepseek_api_key.get_ptr(); }
+void danmaku_set_deepseek_api_key(const char* val) { g_cfg_deepseek_api_key = val; }
+
 
 static int clamp_interval(int v) {
     return std::max(kMinSpawnIntervalMs, std::min(kMaxSpawnIntervalMs, v));
@@ -143,6 +152,14 @@ public:
         danmaku_set_turntable_speed_percent(readInt(m_turntableSpeedEdit, kDefaultTurntableSpeedPercent, clamp_turntable_speed));
         danmaku_set_bk_aspect_min_tenths(readInt(m_bkAspectMinEdit, kDefaultBkAspectMinTenths, clamp_bk_aspect));
         danmaku_set_bk_aspect_max_tenths(readInt(m_bkAspectMaxEdit, kDefaultBkAspectMaxTenths, clamp_bk_aspect));
+        wchar_t keyBuf[512] = {};
+        GetWindowTextW(m_apiKeyEdit, keyBuf, 512);
+        pfc::stringcvt::string_utf8_from_wide utf8_key(keyBuf);
+        danmaku_set_deepseek_api_key(utf8_key.get_ptr());
+        if (g_music) {
+            music_client_set_deepseek_api_key(g_music, utf8_key.get_ptr());
+        }
+
         writeEdit(danmaku_get_spawn_interval_ms());
         writeTracks(danmaku_get_track_count());
         writeSpeed(danmaku_get_speed_percent());
@@ -160,11 +177,12 @@ public:
         writeTurntableSpeed(kDefaultTurntableSpeedPercent);
         writeBkAspectMin(kDefaultBkAspectMinTenths);
         writeBkAspectMax(kDefaultBkAspectMaxTenths);
+        SetWindowTextW(m_apiKeyEdit, L"");
         if (m_callback.is_valid()) m_callback->on_state_changed();
     }
 
 private:
-    enum { IDC_INTERVAL = 1001, IDC_TRACKS = 1002, IDC_SPEED = 1003, IDC_TURNTABLE_SPEED = 1004, IDC_BK_ASPECT_MIN = 1005, IDC_BK_ASPECT_MAX = 1006, IDC_PROVIDER_LIST = 1010 };
+    enum { IDC_INTERVAL = 1001, IDC_TRACKS = 1002, IDC_SPEED = 1003, IDC_TURNTABLE_SPEED = 1004, IDC_BK_ASPECT_MIN = 1005, IDC_BK_ASPECT_MAX = 1006, IDC_PROVIDER_LIST = 1010, IDC_API_KEY = 1011, IDC_CLEAR_CACHE = 1012 };
 
     HWND m_parent;
     preferences_page_callback::ptr m_callback;
@@ -176,6 +194,7 @@ private:
     HWND m_bkAspectMinEdit;
     HWND m_bkAspectMaxEdit;
     HWND m_providerList;
+    HWND m_apiKeyEdit;
     int  m_dragSrc;
     int  m_dragDst;
     bool m_dragging;
@@ -193,9 +212,17 @@ private:
         if (msg == WM_COMMAND &&
             (LOWORD(wp) == IDC_INTERVAL || LOWORD(wp) == IDC_TRACKS || LOWORD(wp) == IDC_SPEED ||
              LOWORD(wp) == IDC_TURNTABLE_SPEED || LOWORD(wp) == IDC_BK_ASPECT_MIN ||
-             LOWORD(wp) == IDC_BK_ASPECT_MAX) &&
+             LOWORD(wp) == IDC_BK_ASPECT_MAX || LOWORD(wp) == IDC_API_KEY) &&
             HIWORD(wp) == EN_CHANGE) {
             if (self->m_callback.is_valid()) self->m_callback->on_state_changed();
+            return 0;
+        }
+
+        if (msg == WM_COMMAND && LOWORD(wp) == IDC_CLEAR_CACHE && HIWORD(wp) == BN_CLICKED) {
+            if (g_music) {
+                music_client_clear_deepseek_cache(g_music);
+                MessageBoxW(hwnd, L"DeepSeek cache has been successfully cleared.", L"FooBar Danmaku", MB_OK | MB_ICONINFORMATION);
+            }
             return 0;
         }
 
@@ -368,6 +395,26 @@ private:
         ListView_InsertColumn(m_providerList, 0, &col);
 
         populateProviderList();
+
+        /* ── DeepSeek API Key section ── */
+        CreateWindowExW(0, L"STATIC",
+            L"DeepSeek API Key (for LLM song matching fallback):",
+            WS_CHILD | WS_VISIBLE,
+            12, 485, 380, 20, m_wnd, nullptr, inst, nullptr);
+
+        m_apiKeyEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD,
+            12, 505, 380, 24, m_wnd, (HMENU)(INT_PTR)IDC_API_KEY, inst, nullptr);
+
+        SendMessageW(m_apiKeyEdit, EM_SETLIMITTEXT, 511, 0);
+
+        std::string saved_key = danmaku_get_deepseek_api_key();
+        pfc::stringcvt::string_wide_from_utf8 wkey(saved_key.c_str());
+        SetWindowTextW(m_apiKeyEdit, wkey.get_ptr());
+
+        CreateWindowExW(0, L"BUTTON", L"Clear Cache",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            400, 505, 100, 24, m_wnd, (HMENU)(INT_PTR)IDC_CLEAR_CACHE, inst, nullptr);
     }
 
     int readInt(HWND edit, int defaultValue, int (*clampFn)(int)) const {
@@ -420,6 +467,13 @@ private:
             readInt(m_bkAspectMaxEdit, kDefaultBkAspectMaxTenths, clamp_bk_aspect)
                 != danmaku_get_bk_aspect_max_tenths())
             return true;
+        {
+            wchar_t keyBuf[512] = {};
+            GetWindowTextW(m_apiKeyEdit, keyBuf, 512);
+            pfc::stringcvt::string_utf8_from_wide utf8_key(keyBuf);
+            std::string saved_key = danmaku_get_deepseek_api_key();
+            if (strcmp(utf8_key.get_ptr(), saved_key.c_str()) != 0) return true;
+        }
         /* Check whether the provider order in the ListView differs from g_music. */
         if (!g_music || !m_providerList) return false;
         int n = music_client_get_provider_count(g_music);

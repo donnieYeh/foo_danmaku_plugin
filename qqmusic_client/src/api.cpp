@@ -124,9 +124,112 @@ static bool check_api_code(const std::string& resp,
     return true;
 }
 
+static bool is_cjk(const std::wstring& s) {
+    for (wchar_t c : s) {
+        if (c >= 0x2E80) return true;
+    }
+    return false;
+}
+
+static bool has_match(const std::wstring& target, const std::wstring& term) {
+    if (term.empty() || target.empty()) return false;
+    if (is_cjk(term)) {
+        return target.find(term) != std::wstring::npos;
+    }
+    size_t pos = 0;
+    while ((pos = target.find(term, pos)) != std::wstring::npos) {
+        bool before_ok = true;
+        if (pos > 0) {
+            wchar_t prev = target[pos - 1];
+            if ((prev >= L'a' && prev <= L'z') || (prev >= L'A' && prev <= L'Z') || (prev >= L'0' && prev <= L'9')) {
+                before_ok = false;
+            }
+        }
+        bool after_ok = true;
+        if (pos + term.size() < target.size()) {
+            wchar_t next = target[pos + term.size()];
+            if ((next >= L'a' && next <= L'z') || (next >= L'A' && next <= L'Z') || (next >= L'0' && next <= L'9')) {
+                after_ok = false;
+            }
+        }
+        if (before_ok && after_ok) {
+            return true;
+        }
+        pos += 1;
+    }
+    return false;
+}
+
+static bool contains_unrequested_noise(const std::wstring& target, const std::vector<std::wstring>& query_terms) {
+    static const std::vector<std::wstring> noise_words = {
+        L"instrumental", L"instrument", L"inst", L"karaoke", L"伴奏", L"伴奏版", L"伴奏型",
+        L"guide", L"melody", L"backing", L"offvocal", L"off vocal", L"piano", L"acoustic",
+        L"remix", L"cover", L"翻唱", L"tribute", L"orchestra", L"orgel", L"八音盒"
+    };
+    for (const auto& noise : noise_words) {
+        if (target.find(noise) != std::wstring::npos) {
+            bool requested = false;
+            for (const auto& term : query_terms) {
+                if (term.find(noise) != std::wstring::npos || noise.find(term) != std::wstring::npos) {
+                    requested = true;
+                    break;
+                }
+            }
+            if (!requested) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool check_word_coverage(const std::wstring& norm_title, const std::vector<std::wstring>& query_terms) {
+    bool has_cjk_term = false;
+    for (const auto& term : query_terms) {
+        if (is_cjk(term)) {
+            has_cjk_term = true;
+            break;
+        }
+    }
+    if (has_cjk_term) return true;
+
+    std::vector<std::wstring> candidate_words;
+    std::wstringstream ss(norm_title);
+    std::wstring word;
+    while (ss >> word) {
+        candidate_words.push_back(word);
+    }
+    if (candidate_words.empty()) return false;
+
+    static const std::vector<std::wstring> allowed_extra = {
+        L"original", L"mix", L"remix", L"edit", L"version", L"ver", L"single", L"album",
+        L"ost", L"theme", L"song", L"op", L"ed", L"tv", L"size", L"karaoke", L"instrumental",
+        L"inst", L"live", L"acoustic", L"cover", L"tribute", L"orchestra", L"piano", L"cv",
+        L"bonus", L"track", L"cd", L"the", L"a", L"of", L"in", L"and", L"to", L"for", L"with",
+        L"by", L"feat", L"ft"
+    };
+
+    int core_words = 0;
+    int matched_core = 0;
+    for (const auto& w : candidate_words) {
+        bool is_metadata = (std::find(allowed_extra.begin(), allowed_extra.end(), w) != allowed_extra.end());
+        if (!is_metadata) {
+            core_words++;
+            for (const auto& term : query_terms) {
+                if (w == term) {
+                    matched_core++;
+                    break;
+                }
+            }
+        }
+    }
+    if (core_words == 0) return true;
+    double coverage = (double)matched_core / core_words;
+    return coverage >= 0.7;
+}
+
 static std::wstring normalize_str(const std::wstring& src) {
     if (src.empty()) return L"";
-    // Convert to simplified Chinese and lowercase using LCMapStringW
     int size = LCMapStringW(LOCALE_USER_DEFAULT, LCMAP_SIMPLIFIED_CHINESE | LCMAP_LOWERCASE, src.c_str(), (int)src.size(), nullptr, 0);
     if (size <= 0) return L"";
     std::wstring dest(size, L'\0');
@@ -135,9 +238,16 @@ static std::wstring normalize_str(const std::wstring& src) {
     std::wstring filtered;
     filtered.reserve(dest.size());
     for (wchar_t c : dest) {
-        if (iswspace(c) || iswpunct(c)) continue;
-        if (c == L'（' || c == L'）' || c == L'【' || c == L'】' || c == L'「' || c == L'」' || c == L'～' || c == L'~') continue;
-        filtered += c;
+        if (iswspace(c) || iswpunct(c) || c == L'（' || c == L'）' || c == L'【' || c == L'】' || c == L'「' || c == L'」' || c == L'～' || c == L'~' || c == L'・') {
+            if (filtered.empty() || filtered.back() != L' ') {
+                filtered += L' ';
+            }
+        } else {
+            filtered += c;
+        }
+    }
+    if (!filtered.empty() && filtered.back() == L' ') {
+        filtered.pop_back();
     }
     return filtered;
 }
@@ -149,7 +259,13 @@ static std::vector<std::wstring> split_keyword_to_terms(const std::wstring& keyw
     while (std::getline(ss, item, L' ')) {
         std::wstring norm = normalize_str(item);
         if (!norm.empty()) {
-            terms.push_back(norm);
+            std::wstringstream ss2(norm);
+            std::wstring subitem;
+            while (ss2 >> subitem) {
+                if (std::find(terms.begin(), terms.end(), subitem) == terms.end()) {
+                    terms.push_back(subitem);
+                }
+            }
         }
     }
     return terms;
@@ -226,16 +342,34 @@ SongInfo ApiClient::search_song_info(
         std::wstring artist = json::to_wide(json::str(item, "singer"));
         std::wstring norm_artist = normalize_str(artist);
 
-        int matched_count = 0;
+        bool title_matched = false;
         for (const auto& term : query_terms) {
-            bool term_found = false;
-            if (norm_title.find(term) != std::wstring::npos) {
-                term_found = true;
-            } else if (norm_artist.find(term) != std::wstring::npos) {
-                term_found = true;
+            if (has_match(norm_title, term)) {
+                title_matched = true;
+                break;
             }
-            if (term_found) {
-                matched_count++;
+        }
+
+        if (title_matched && contains_unrequested_noise(norm_title, query_terms)) {
+            title_matched = false;
+        }
+
+        if (title_matched && !check_word_coverage(norm_title, query_terms)) {
+            title_matched = false;
+        }
+
+        int matched_count = 0;
+        if (title_matched) {
+            for (const auto& term : query_terms) {
+                bool term_found = false;
+                if (has_match(norm_title, term)) {
+                    term_found = true;
+                } else if (has_match(norm_artist, term)) {
+                    term_found = true;
+                }
+                if (term_found) {
+                    matched_count++;
+                }
             }
         }
 
@@ -244,6 +378,13 @@ SongInfo ApiClient::search_song_info(
             best_index = i;
         }
     }
+
+    if (max_matches <= 0) {
+        error_msg = L"No matching song terms found for: " + keyword;
+        loga("search_song: max_matches <= 0, returning empty");
+        return info;
+    }
+
 
     const std::string& best_song = songs[best_index];
 

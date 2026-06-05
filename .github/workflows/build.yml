@@ -92,11 +92,16 @@ jobs:
         run: |
           pwsh -File foobar_comment_flow/foo_danmaku/build.ps1 -Platform x64
 
-      # --- Package both architectures ---
-      - name: Package Component
+      # --- Package separate architectures ---
+      - name: Package Component (x64)
         shell: pwsh
         run: |
-          pwsh -File foobar_comment_flow/pack.ps1 -Version "${{ steps.get_version.outputs.VERSION }}"
+          pwsh -File foobar_comment_flow/pack.ps1 -Platform x64 -Version "${{ steps.get_version.outputs.VERSION }}"
+
+      - name: Package Component (Win32)
+        shell: pwsh
+        run: |
+          pwsh -File foobar_comment_flow/pack.ps1 -Platform Win32 -Version "${{ steps.get_version.outputs.VERSION }}"
 
       # --- Create Release and Upload Asset ---
       - name: Create Release
