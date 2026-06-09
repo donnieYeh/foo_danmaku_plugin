@@ -45,6 +45,26 @@ typedef void (__stdcall *MusicLogCallback)(
     const wchar_t* msg,
     void*          userdata);
 
+/* Optional extension export. Providers may export this function in addition
+ * to music_provider_vtable(). Layer 2 probes for it with GetProcAddress and
+ * falls back to MusicProviderVTable::search_song when it is absent. */
+typedef struct MusicStructuredSearchQuery {
+    const wchar_t* title;       /* required */
+    const wchar_t* artist;      /* optional */
+    const wchar_t* album;       /* optional */
+    int            duration_ms; /* optional; 0 if unknown */
+} MusicStructuredSearchQuery;
+
+typedef int (__stdcall *music_provider_search_track_fn)(
+    MusicProviderHandle              h,
+    const MusicStructuredSearchQuery* query,
+    wchar_t*                         out_song_id,
+    int                              song_id_buf_wchars,
+    wchar_t*                         out_cover_url,
+    int                              cover_url_buf_wchars);
+
+#define MUSIC_PROVIDER_SEARCH_TRACK_EXPORT "music_provider_search_track"
+
 /* ── driver vtable ───────────────────────────────────── */
 typedef struct MusicProviderVTable {
 
@@ -86,13 +106,41 @@ typedef struct MusicProviderVTable {
 
     /* --- comments ----------------------------------------- */
 
-    /** Fetch one page of comments (single HTTP request).
+    /** Fetch one page of comments (single HTTP round-trip).
      *
-     *  On the first page (offset == 0) hot/top comments are emitted before
-     *  the regular list.  Returns MUSIC_OK even when 0 comments are delivered
-     *  (signals end-of-stream).
+     *  OFFSET SEMANTICS
+     *  ----------------
+     *  @param offset      Logical zero-based comment index.  The caller
+     *                     advances it by the previously delivered count:
+     *                       nextOffset += last_delivered
+     *                     Providers that use page-number APIs internally
+     *                     MUST compute their page number as:
+     *                       page_num = offset / actual_page_size
+     *                     where actual_page_size is the number the remote
+     *                     API actually returns per request — NOT page_limit.
+     *                     (These two differ when the API caps page size
+     *                     below what the caller requested.)
      *
-     *  @param out_delivered  Set to the number of comments passed to callback. */
+     *  END-OF-STREAM CONTRACT
+     *  ----------------------
+     *  - *out_delivered == 0 AND return == MUSIC_OK  →  end of stream.
+     *    The caller will stop paging when it sees this.
+     *  - *out_delivered < page_limit                 →  NOT end of stream.
+     *    Providers are allowed to return fewer items than requested (e.g.
+     *    because the remote API caps page size); callers MUST NOT treat a
+     *    short page as the end of the comment stream.
+     *
+     *  OTHER RULES
+     *  -----------
+     *  - On the first page (offset == 0) emit hot/top comments before the
+     *    regular list if the platform provides them.
+     *  - Return MUSIC_OK even when 0 comments are delivered.
+     *  - If the callback returns non-zero, stop early and return MUSIC_OK
+     *    with *out_delivered set to the count emitted so far.
+     *
+     *  @param page_limit    Maximum comments the caller wants this call to
+     *                       deliver.  Providers may deliver fewer (see above).
+     *  @param out_delivered Set to the number of comments passed to callback. */
     int (__stdcall *get_comments_paged)(
         MusicProviderHandle  h,
         const wchar_t*       song_id,

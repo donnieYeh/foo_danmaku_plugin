@@ -16,6 +16,13 @@ struct SongInfo {
     std::wstring cover_url;
 };
 
+struct SearchQuery {
+    std::wstring title;
+    std::wstring artist;
+    std::wstring album;
+    int          duration_ms = 0;
+};
+
 /** Return false to stop iteration early. */
 using CommentVisitor = std::function<bool(const Comment&)>;
 
@@ -32,6 +39,9 @@ public:
 
     SongInfo search_song_info(const std::wstring& keyword,
                               std::wstring&       error_msg);
+
+    SongInfo search_song_info(const SearchQuery& query,
+                              std::wstring&      error_msg);
 
     /**
      * Iterate comments for song_id.

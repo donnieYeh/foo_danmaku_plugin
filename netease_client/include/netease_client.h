@@ -129,6 +129,22 @@ NETEASE_API int __stdcall netease_search_song_with_cover(
     int            cover_url_buf_wchars
 );
 
+/**
+ * Structured search variant for callers that know field boundaries.
+ * duration_ms may be 0 when unknown. ABI-compatible optional export.
+ */
+NETEASE_API int __stdcall netease_search_track_with_cover(
+    NeteaseHandle  h,
+    const wchar_t* title,
+    const wchar_t* artist,
+    const wchar_t* album,
+    int            duration_ms,
+    wchar_t*       out_song_id,
+    int            song_id_buf_wchars,
+    wchar_t*       out_cover_url,
+    int            cover_url_buf_wchars
+);
+
 /* ── diagnostics ─────────────────────────────────────── */
 
 /**

@@ -100,6 +100,44 @@ QQMUSIC_API int __stdcall qqmusic_search_song_with_cover(
     return QQMUSIC_OK;
 }
 
+QQMUSIC_API int __stdcall qqmusic_search_track_with_cover(
+    QQMusicHandle  h,
+    const wchar_t* title,
+    const wchar_t* artist,
+    const wchar_t* album,
+    int            duration_ms,
+    wchar_t*       out_song_mid,
+    int            song_mid_buf_wchars,
+    wchar_t*       out_cover_url,
+    int            cover_url_buf_wchars)
+{
+    if (!h || !title || !*title || !out_song_mid || song_mid_buf_wchars < 2)
+        return QQMUSIC_ERR_PARAM;
+
+    if (out_cover_url && cover_url_buf_wchars > 0) out_cover_url[0] = 0;
+
+    QQMusicContext* c = ctx(h);
+    std::wstring err;
+    qqmusic::SearchQuery query;
+    query.title = title;
+    query.artist = artist ? artist : L"";
+    query.album = album ? album : L"";
+    query.duration_ms = duration_ms;
+
+    qqmusic::SongInfo info = c->api.search_song_info(query, err);
+    if (info.id.empty()) {
+        set_error(c, err);
+        return err.find(L"No songs") != std::wstring::npos
+               ? QQMUSIC_ERR_NOTFOUND : QQMUSIC_ERR_NETWORK;
+    }
+    wcsncpy_s(out_song_mid, song_mid_buf_wchars, info.id.c_str(), _TRUNCATE);
+    if (out_cover_url && cover_url_buf_wchars > 0 && !info.cover_url.empty()) {
+        wcsncpy_s(out_cover_url, cover_url_buf_wchars,
+                  info.cover_url.c_str(), _TRUNCATE);
+    }
+    return QQMUSIC_OK;
+}
+
 /* ── get_comments_by_id ──────────────────────────────── */
 
 QQMUSIC_API int __stdcall qqmusic_get_comments_by_id(

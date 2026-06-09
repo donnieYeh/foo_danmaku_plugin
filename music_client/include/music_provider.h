@@ -45,6 +45,26 @@ typedef void (__stdcall *MusicLogCallback)(
     const wchar_t* msg,
     void*          userdata);
 
+/* Optional extension export. Providers may export this function in addition
+ * to music_provider_vtable(). Layer 2 probes for it with GetProcAddress and
+ * falls back to MusicProviderVTable::search_song when it is absent. */
+typedef struct MusicStructuredSearchQuery {
+    const wchar_t* title;       /* required */
+    const wchar_t* artist;      /* optional */
+    const wchar_t* album;       /* optional */
+    int            duration_ms; /* optional; 0 if unknown */
+} MusicStructuredSearchQuery;
+
+typedef int (__stdcall *music_provider_search_track_fn)(
+    MusicProviderHandle              h,
+    const MusicStructuredSearchQuery* query,
+    wchar_t*                         out_song_id,
+    int                              song_id_buf_wchars,
+    wchar_t*                         out_cover_url,
+    int                              cover_url_buf_wchars);
+
+#define MUSIC_PROVIDER_SEARCH_TRACK_EXPORT "music_provider_search_track"
+
 /* ── driver vtable ───────────────────────────────────── */
 typedef struct MusicProviderVTable {
 

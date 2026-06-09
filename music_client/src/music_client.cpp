@@ -34,6 +34,7 @@ struct ProviderSlot {
     HMODULE                    dll    = nullptr;
     MusicProviderHandle        handle = nullptr;
     const MusicProviderVTable* vtable = nullptr;
+    music_provider_search_track_fn search_track = nullptr;
     std::wstring               path;           /* full DLL path, for introspection */
 };
 
@@ -310,17 +311,39 @@ static int resolve_provider_for_session(
     wchar_t song_id[128] = {};
     wchar_t cover_url[2048] = {};
 
-    for (const auto& kw : keywords) {
-        c->log(L"[music_client] attempting search for provider=" + std::to_wstring(provider_idx) + L" with keyword: " + kw);
-        song_id[0] = L'\0';
-        cover_url[0] = L'\0';
-        rc = p.vtable->search_song(
+    if (p.search_track) {
+        MusicStructuredSearchQuery structured = {};
+        structured.title = cleaned_title.empty() ? sess->title.c_str() : cleaned_title.c_str();
+        structured.artist = cleaned_artist.empty() ? nullptr : cleaned_artist.c_str();
+        structured.album = cleaned_album.empty() ? nullptr : cleaned_album.c_str();
+        structured.duration_ms = sess->duration_ms;
+
+        c->log(L"[music_client] attempting structured search for provider="
+               + std::to_wstring(provider_idx)
+               + L" title=\"" + (structured.title ? structured.title : L"")
+               + L"\" artist=\"" + (structured.artist ? structured.artist : L"")
+               + L"\" album=\"" + (structured.album ? structured.album : L"")
+               + L"\" duration_ms=" + std::to_wstring(structured.duration_ms));
+        rc = p.search_track(
             p.handle,
-            kw.c_str(),
+            &structured,
             song_id, (int)_countof(song_id),
             cover_url, (int)_countof(cover_url));
-        if (rc == MUSIC_OK && song_id[0] != L'\0') {
-            break;
+    }
+
+    if (rc != MUSIC_OK || song_id[0] == L'\0') {
+        for (const auto& kw : keywords) {
+            c->log(L"[music_client] attempting search for provider=" + std::to_wstring(provider_idx) + L" with keyword: " + kw);
+            song_id[0] = L'\0';
+            cover_url[0] = L'\0';
+            rc = p.vtable->search_song(
+                p.handle,
+                kw.c_str(),
+                song_id, (int)_countof(song_id),
+                cover_url, (int)_countof(cover_url));
+            if (rc == MUSIC_OK && song_id[0] != L'\0') {
+                break;
+            }
         }
     }
 
@@ -565,6 +588,8 @@ int music_client_load_provider(
     slot.dll    = dll;
     slot.handle = ph;
     slot.vtable = vtable;
+    slot.search_track = reinterpret_cast<music_provider_search_track_fn>(
+        GetProcAddress(dll, MUSIC_PROVIDER_SEARCH_TRACK_EXPORT));
     slot.path   = dll_path;
     c->providers.push_back(std::move(slot));
 
@@ -1086,4 +1111,3 @@ void music_client_clear_deepseek_cache(MusicClientHandle h)
     (void)h;
     deepseek_clear_cache();
 }
-

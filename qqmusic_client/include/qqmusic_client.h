@@ -92,6 +92,22 @@ QQMUSIC_API int __stdcall qqmusic_search_song_with_cover(
     int            cover_url_buf_wchars
 );
 
+/**
+ * Structured search variant for callers that know field boundaries.
+ * duration_ms may be 0 when unknown. ABI-compatible optional export.
+ */
+QQMUSIC_API int __stdcall qqmusic_search_track_with_cover(
+    QQMusicHandle  h,
+    const wchar_t* title,
+    const wchar_t* artist,
+    const wchar_t* album,
+    int            duration_ms,
+    wchar_t*       out_song_mid,
+    int            song_mid_buf_wchars,
+    wchar_t*       out_cover_url,
+    int            cover_url_buf_wchars
+);
+
 /* ── comments ────────────────────────────────────────── */
 
 /**

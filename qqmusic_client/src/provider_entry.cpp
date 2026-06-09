@@ -93,3 +93,24 @@ static const MusicProviderVTable kQQMusicVTable = {
 MUSIC_PROVIDER_API const MusicProviderVTable* __stdcall music_provider_vtable(void) {
     return &kQQMusicVTable;
 }
+
+MUSIC_PROVIDER_API int __stdcall music_provider_search_track(
+    MusicProviderHandle              h,
+    const MusicStructuredSearchQuery* query,
+    wchar_t*                         out_song_id,
+    int                              song_id_buf_wchars,
+    wchar_t*                         out_cover_url,
+    int                              cover_url_buf_wchars)
+{
+    if (!query) return QQMUSIC_ERR_PARAM;
+    return qqmusic_search_track_with_cover(
+        h,
+        query->title,
+        query->artist,
+        query->album,
+        query->duration_ms,
+        out_song_id,
+        song_id_buf_wchars,
+        out_cover_url,
+        cover_url_buf_wchars);
+}

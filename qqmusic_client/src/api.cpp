@@ -277,7 +277,29 @@ SongInfo ApiClient::search_song_info(
     const std::wstring& keyword,
     std::wstring&       error_msg)
 {
+    SearchQuery q;
+    q.title = keyword;
+    return search_song_info(q, error_msg);
+}
+
+static int duration_score(int query_ms, int candidate_ms) {
+    if (query_ms <= 0 || candidate_ms <= 0) return 0;
+    int diff = std::abs(query_ms - candidate_ms);
+    if (diff <= 2000) return 18;
+    if (diff <= 5000) return 12;
+    if (diff <= 10000) return 5;
+    if (diff >= 30000) return -18;
+    return -6;
+}
+
+SongInfo ApiClient::search_song_info(
+    const SearchQuery& query,
+    std::wstring&      error_msg)
+{
     SongInfo info;
+    std::wstring keyword = query.title;
+    if (!query.artist.empty()) keyword += L" " + query.artist;
+    if (!query.album.empty()) keyword += L" " + query.album;
     std::string kw_utf8    = json::to_utf8(keyword);
     std::string kw_encoded = url_encode_utf8(kw_utf8);
     loga("search_song keyword: " + kw_utf8);
@@ -329,10 +351,16 @@ SongInfo ApiClient::search_song_info(
         return info;
     }
 
-    // Rank and select the best matching song
     int best_index = 0;
-    int max_matches = -1;
+    int best_score = -100000;
+    int best_matches = 0;
     auto query_terms = split_keyword_to_terms(keyword);
+    auto title_terms = split_keyword_to_terms(query.title);
+    auto artist_terms = split_keyword_to_terms(query.artist);
+    auto album_terms = split_keyword_to_terms(query.album);
+    std::wstring norm_query_title = normalize_str(query.title);
+    std::wstring norm_query_artist = normalize_str(query.artist);
+    const bool structured_terms = !artist_terms.empty() || !album_terms.empty();
 
     for (int i = 0; i < (int)songs.size(); i++) {
         const auto& item = songs[i];
@@ -341,9 +369,14 @@ SongInfo ApiClient::search_song_info(
 
         std::wstring artist = json::to_wide(json::str(item, "singer"));
         std::wstring norm_artist = normalize_str(artist);
+        std::wstring album = json::to_wide(json::str(item, "album"));
+        std::wstring norm_album = normalize_str(album);
+        int candidate_duration = (int)json::num(item, "interval", 0);
+        if (candidate_duration > 0 && candidate_duration < 10000) candidate_duration *= 1000;
 
+        int score = 0;
         bool title_matched = false;
-        for (const auto& term : query_terms) {
+        for (const auto& term : title_terms.empty() ? query_terms : title_terms) {
             if (has_match(norm_title, term)) {
                 title_matched = true;
                 break;
@@ -360,28 +393,57 @@ SongInfo ApiClient::search_song_info(
 
         int matched_count = 0;
         if (title_matched) {
-            for (const auto& term : query_terms) {
-                bool term_found = false;
-                if (has_match(norm_title, term)) {
-                    term_found = true;
-                } else if (has_match(norm_artist, term)) {
-                    term_found = true;
+            score += 45;
+            if (!norm_query_title.empty() && norm_title == norm_query_title) {
+                score += 35;
+            }
+            for (const auto& term : title_terms.empty() ? query_terms : title_terms) {
+                bool term_found = has_match(norm_title, term);
+                if (!structured_terms && !term_found) {
+                    term_found = has_match(norm_artist, term) ||
+                                 has_match(norm_album, term);
                 }
                 if (term_found) {
                     matched_count++;
+                    score += 10;
                 }
+            }
+        } else {
+            score -= 60;
+        }
+
+        bool artist_matched = false;
+        for (const auto& term : artist_terms) {
+            if (has_match(norm_artist, term)) {
+                artist_matched = true;
+                matched_count++;
+                score += 18;
+            }
+        }
+        if (!artist_terms.empty() && !artist_matched) score -= 18;
+        if (!norm_query_artist.empty() && norm_artist == norm_query_artist) {
+            score += 22;
+        }
+
+        for (const auto& term : album_terms) {
+            if (has_match(norm_album, term)) {
+                matched_count++;
+                score += 4;
             }
         }
 
-        if (matched_count > max_matches) {
-            max_matches = matched_count;
+        score += duration_score(query.duration_ms, candidate_duration);
+
+        if (score > best_score) {
+            best_score = score;
+            best_matches = matched_count;
             best_index = i;
         }
     }
 
-    if (max_matches <= 0) {
+    if (best_matches <= 0 || best_score <= 0) {
         error_msg = L"No matching song terms found for: " + keyword;
-        loga("search_song: max_matches <= 0, returning empty");
+        loga("search_song: no positive structured score, returning empty");
         return info;
     }
 
@@ -403,7 +465,10 @@ SongInfo ApiClient::search_song_info(
         return info;
     }
     info.id = std::to_wstring(id_num);
-    log(L"search_song: selected index=" + std::to_wstring(best_index) + L" id=" + info.id + L" term_matches=" + std::to_wstring(max_matches));
+    log(L"search_song: selected index=" + std::to_wstring(best_index)
+        + L" id=" + info.id
+        + L" score=" + std::to_wstring(best_score)
+        + L" term_matches=" + std::to_wstring(best_matches));
 
     std::string mid_str = json::str(best_song, "mid");
     info.mid = json::to_wide(mid_str);

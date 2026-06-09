@@ -426,7 +426,12 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, cons
     metadb_handle_ptr currentTrack;
     if (g_monitor) currentTrack = g_monitor->getCurrentTrack();
 
-    std::thread([targetHwnd, titleStr, artistStr, albumStr, currentTrack, gen]() {
+    double currentDurationSec = 0.0;
+    if (!currentTrack.is_empty()) {
+        currentDurationSec = currentTrack->get_length();
+    }
+
+    std::thread([targetHwnd, titleStr, artistStr, albumStr, currentTrack, currentDurationSec, gen]() {
         const int  kInitialBurst   = 100;   // first batch — enough to start playing
         const int  kPageSize       = 50;    // incremental page size
         const int  kLowWaterMark   = 30;    // when poolRemaining ≤ this, prefetch
@@ -444,7 +449,9 @@ static void onNewTrackCallback(const wchar_t* title, const wchar_t* artist, cons
         query.title = titleStr.c_str();
         query.artist = artistStr.empty() ? nullptr : artistStr.c_str();
         query.album = albumStr.empty() ? nullptr : albumStr.c_str();
-        query.duration_ms = 0;
+        query.duration_ms = currentDurationSec > 0.0
+            ? (int)(currentDurationSec * 1000.0 + 0.5)
+            : 0;
 
         MusicTrackSessionHandle session = nullptr;
         int rc = music_client_open_track_session(g_music, &query, &session);
@@ -805,4 +812,3 @@ LRESULT CALLBACK DanmakuUIWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam,
     }
     return 0;
 }
-

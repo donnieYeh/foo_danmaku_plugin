@@ -98,6 +98,44 @@ NETEASE_API int __stdcall netease_search_song_with_cover(
     return NETEASE_OK;
 }
 
+NETEASE_API int __stdcall netease_search_track_with_cover(
+    NeteaseHandle  h,
+    const wchar_t* title,
+    const wchar_t* artist,
+    const wchar_t* album,
+    int            duration_ms,
+    wchar_t*       out_song_id,
+    int            song_id_buf_wchars,
+    wchar_t*       out_cover_url,
+    int            cover_url_buf_wchars)
+{
+    if (!h || !title || !*title || !out_song_id || song_id_buf_wchars < 2)
+        return NETEASE_ERR_PARAM;
+
+    if (out_cover_url && cover_url_buf_wchars > 0) out_cover_url[0] = 0;
+
+    NeteaseContext* c = ctx(h);
+    std::wstring err;
+    netease::SearchQuery query;
+    query.title = title;
+    query.artist = artist ? artist : L"";
+    query.album = album ? album : L"";
+    query.duration_ms = duration_ms;
+
+    netease::SongInfo info = c->api.search_song_info(query, err);
+    if (info.id.empty()) {
+        set_error(c, err);
+        return err.find(L"No songs") != std::wstring::npos
+               ? NETEASE_ERR_NOTFOUND : NETEASE_ERR_NETWORK;
+    }
+    wcsncpy_s(out_song_id, song_id_buf_wchars, info.id.c_str(), _TRUNCATE);
+    if (out_cover_url && cover_url_buf_wchars > 0 && !info.cover_url.empty()) {
+        wcsncpy_s(out_cover_url, cover_url_buf_wchars,
+                  info.cover_url.c_str(), _TRUNCATE);
+    }
+    return NETEASE_OK;
+}
+
 /* ── get_comments_by_id ──────────────────────────────── */
 
 NETEASE_API int __stdcall netease_get_comments_by_id(
